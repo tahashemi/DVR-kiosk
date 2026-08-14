@@ -46,6 +46,17 @@ curl -fsSL https://raw.githubusercontent.com/tahashemi/DVR-kiosk/main/install.sh
 
 ---
 
+## 🗑️ Quick Uninstall (1-Line Complete Removal)
+
+To completely remove DVR Kiosk, all systemd services (`dvr-kiosk`, `dvrwall`, `go2rtc`), binaries, and configurations:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tahashemi/DVR-kiosk/main/uninstall.sh | sudo bash
+```
+
+---
+
+
 ## 💻 Interactive CLI Management
 
 Simply type `dvr-kiosk` in your terminal to open the interactive management menu:
