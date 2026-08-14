@@ -1,0 +1,15 @@
+[Unit]
+Description=DVR Kiosk Remote Controller & WebUI
+After=network.target go2rtc.service dvrwall.service
+Wants=go2rtc.service dvrwall.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dvr-kiosk
+ExecStart=/opt/dvr-kiosk/venv/bin/python3 /opt/dvr-kiosk/src/dvr_control.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Build artifacts
+bin/
+*.o
+*.so
+
+# Runtime data & configs
+*.log
+/certs/
+/etc/
+auth_config.json
+dvr_config.json
+channel_labels.json
+kiosk_profiles.json
+kiosk_schedule.json
+dvr-kiosk.sock
+dvrwall.sock
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+.antigravity/

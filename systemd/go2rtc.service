@@ -1,0 +1,13 @@
+[Unit]
+Description=go2rtc Streaming Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/go2rtc -c /etc/dvr-kiosk/go2rtc.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
