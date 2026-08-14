@@ -683,7 +683,7 @@ HTML = """<!DOCTYPE html>
                 <input type="number" id="addDvrPort" placeholder="Port (3456)" class="search-input" value="3456" style="flex:1;">
                 <input type="number" id="addDvrChs" placeholder="Channels (8)" class="search-input" value="8" style="flex:1;">
               </div>
-              <input type="password" id="addDvrPass" placeholder="DVR Password" class="search-input">
+              <input type="password" id="addDvrPass" placeholder="DVR Password (default 9198129192)" class="search-input">
               <button id="btnSubmitAddDvr" class="primary" style="width:100%;">Save DVR</button>
             </div>
           </div>
@@ -1141,8 +1141,10 @@ async function refreshStatus() {
     }
   } catch(e) {}
 
-  renderKioskGrid();
-  renderPool();
+  if (!editMode) {
+    renderKioskGrid();
+    renderPool();
+  }
 }
 
 function showHdrMenu() {
@@ -1500,11 +1502,19 @@ def add_security_headers(resp):
 
 @app.route('/static/Sortable.min.js')
 def static_sortable():
-    js_path = os.path.join(os.path.dirname(__file__), "Sortable.min.js")
-    if os.path.exists(js_path):
-        with open(js_path, "r", encoding="utf-8") as f:
-            return Response(f.read(), mimetype="application/javascript")
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "static", "Sortable.min.js"),
+        os.path.join(os.path.dirname(__file__), "Sortable.min.js"),
+        "/opt/dvr-kiosk/src/static/Sortable.min.js",
+        "/opt/dvr-kiosk/src/Sortable.min.js",
+        "/etc/dvr-kiosk/Sortable.min.js",
+    ]
+    for js_path in candidates:
+        if os.path.exists(js_path):
+            with open(js_path, "r", encoding="utf-8") as f:
+                return Response(f.read(), mimetype="application/javascript")
     return "not found", 404
+
 
 
 # ---- Authentication API Endpoints ----
