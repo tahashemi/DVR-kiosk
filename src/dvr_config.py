@@ -7,6 +7,7 @@ import subprocess
 import threading
 
 CONFIG_PATHS = [
+    "/etc/dvr-kiosk/dvr_config.json",
     "/root/dvr_config.json",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "dvr_config.json"),
     "dvr_config.json"
@@ -24,9 +25,11 @@ def _get_config_path():
     for p in CONFIG_PATHS:
         if os.path.exists(p):
             return p
-    # Default to /root/dvr_config.json on Linux, else local dvr_config.json
-    if os.name != 'nt' and os.path.exists("/root"):
-        return "/root/dvr_config.json"
+    if os.name != 'nt':
+        if os.path.exists("/etc/dvr-kiosk"):
+            return "/etc/dvr-kiosk/dvr_config.json"
+        if os.path.exists("/root"):
+            return "/root/dvr_config.json"
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "dvr_config.json")
 
 def load_dvrs():
@@ -136,9 +139,9 @@ def delete_dvr(dvr_key):
     return False
 
 def sync_go2rtc():
-    """Generates /root/go2rtc.yaml for all enabled DVRs (both substream and mainstream) and reloads go2rtc."""
-    yaml_path = "/root/go2rtc.yaml"
-    if not os.path.exists("/root") and os.name == 'nt':
+    """Generates /etc/dvr-kiosk/go2rtc.yaml (and /root/go2rtc.yaml) for all enabled DVRs."""
+    yaml_paths = ["/etc/dvr-kiosk/go2rtc.yaml", "/root/go2rtc.yaml"]
+    if os.name == 'nt':
         return
     try:
         lines = ["streams:"]
@@ -154,10 +157,15 @@ def sync_go2rtc():
                 # Mainstream (subtype=0) for 720p full-screen viewing
                 lines.append(f"  {key}_ch{ch}_main: dvrip://admin:{pwd}@{ip}:{port}?channel={ch - 1}&subtype=0")
         
-        with open(yaml_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+        yaml_content = "\n".join(lines) + "\n"
+        for path in yaml_paths:
+            parent = os.path.dirname(path)
+            if os.path.exists(parent):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(yaml_content)
         
         # Restart or reload go2rtc
         subprocess.run(["systemctl", "restart", "go2rtc.service"], check=False)
     except Exception as e:
         print(f"[dvr_config] Failed to sync go2rtc: {e}")
+

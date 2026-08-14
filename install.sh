@@ -111,6 +111,16 @@ if [ ! -f "${CERTS_DIR}/dvr-kiosk.pem" ]; then
   chmod 600 "${CERTS_DIR}/dvr-kiosk-key.pem"
 fi
 
+# Initialize default Web UI credentials (admin / admin) if missing
+if [ ! -f "${CONFIG_DIR}/auth_config.json" ] && [ ! -f "/root/auth_config.json" ]; then
+  echo -e "  -> Initializing default Web UI credentials (admin / admin)..."
+  "${INSTALL_DIR}/venv/bin/python3" "${INSTALL_DIR}/src/set_password.py" admin admin
+fi
+
+# Generate initial go2rtc streams config
+"${INSTALL_DIR}/venv/bin/python3" -c "import sys; sys.path.insert(0, '${INSTALL_DIR}/src'); import dvr_config; dvr_config.sync_go2rtc()" || true
+
+
 # Configure fail2ban
 cat << 'EOF' > /etc/fail2ban/jail.d/dvr-kiosk.local
 [sshd]

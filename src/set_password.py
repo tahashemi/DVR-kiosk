@@ -13,6 +13,7 @@ import secrets
 import getpass
 
 AUTH_CONFIG_PATHS = [
+    "/etc/dvr-kiosk/auth_config.json",
     "/root/auth_config.json",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth_config.json"),
     "auth_config.json"
@@ -22,8 +23,11 @@ def get_auth_file():
     for p in AUTH_CONFIG_PATHS:
         if os.path.exists(p):
             return p
-    if os.name != 'nt' and os.path.exists("/root"):
-        return "/root/auth_config.json"
+    if os.name != 'nt':
+        if os.path.exists("/etc/dvr-kiosk"):
+            return "/etc/dvr-kiosk/auth_config.json"
+        if os.path.exists("/root"):
+            return "/root/auth_config.json"
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth_config.json")
 
 PBKDF2_ITERATIONS = 100000
