@@ -648,14 +648,15 @@ HTML = """<!DOCTYPE html>
     <div id="hmLogout" class="danger-item">🚪 Sign Out</div>
   </div>
 
-  <!-- Synchronized Web Fullscreen Overlay (Shared Hardware Decode) -->
+  <!-- Synchronized Web Fullscreen Overlay (Shared Hardware Decode & Live Stream) -->
   <div id="webFullscreenOverlay" class="modal-overlay" style="display:none; padding:0; background:#000; z-index:4000; width:100vw; height:100vh; position:fixed; top:0; left:0; right:0; bottom:0;">
     <div style="position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; background:#000; overflow:hidden;">
       <div style="position:absolute; top:12px; left:16px; right:16px; display:flex; align-items:center; justify-content:space-between; z-index:50; pointer-events:none;">
         <span id="webFsTitle" style="font-size:15px; font-weight:700; color:#fff; font-family:var(--font-head); text-shadow:0 2px 4px rgba(0,0,0,0.9); background:rgba(0,0,0,0.65); padding:6px 14px; border-radius:8px; backdrop-filter:blur(4px);"></span>
         <button id="btnCloseWebFs" class="ghost icon" style="font-size:24px; color:#fff; width:44px; height:44px; background:rgba(0,0,0,0.7); border-radius:50%; border:1px solid rgba(255,255,255,0.3); backdrop-filter:blur(8px); pointer-events:auto; cursor:pointer;">✕</button>
       </div>
-      <img id="webFsImg" style="width:100%; height:100%; max-width:100vw; max-height:100vh; object-fit:contain; background:#000;" src="">
+      <video id="webFsVideo" style="width:100%; height:100%; max-width:100vw; max-height:100vh; object-fit:contain; background:#000; aspect-ratio:16/9;" autoplay muted playsinline controls></video>
+      <img id="webFsImg" style="display:none; width:100%; height:100%; max-width:100vw; max-height:100vh; object-fit:contain; background:#000; aspect-ratio:16/9;" src="">
     </div>
   </div>
 
@@ -1038,15 +1039,18 @@ function setStatus(msg) {
 }
 
 /* ---- Synchronized Mainstream Fullscreen (Live Smooth Video) ---- */
+let fsSnapshotTimer = null;
+
 async function fullscreen(dvr, ch) {
   isWebFullscreenActive = true;
   const label = channelLabel(dvr, ch);
   
   const overlay = document.getElementById('webFullscreenOverlay');
   const title = document.getElementById('webFsTitle');
+  const video = document.getElementById('webFsVideo');
   const img = document.getElementById('webFsImg');
   
-  title.textContent = label + ' (HD)';
+  title.textContent = label + ' (HD Mainstream)';
   overlay.style.display = 'flex';
   
   // 1. Tell Kiosk Wall to switch hardware output to mainstream
@@ -1058,20 +1062,36 @@ async function fullscreen(dvr, ch) {
     setStatus('Fullscreen: ' + label);
   } catch(e) {}
 
-  // 2. Connect to continuous live MJPEG mainstream feed (smooth real-time video!)
-  img.src = '/api/live/' + dvr + '/' + ch + '?main=1&t=' + Date.now();
-  img.onerror = () => {
-    img.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
+  // 2. Connect live H.264 video stream first (smooth real-time video)
+  video.style.display = 'block';
+  img.style.display = 'none';
+  video.src = '/api/stream/' + dvr + '/' + ch + '/main.mp4';
+  
+  video.onerror = () => {
+    // If MP4 live video stream encounters an error, fallback to rapid 1-second HD snapshot polling
+    video.style.display = 'none';
+    img.style.display = 'block';
+    const updateFsFrame = () => {
+      img.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
+    };
+    updateFsFrame();
+    clearInterval(fsSnapshotTimer);
+    fsSnapshotTimer = setInterval(updateFsFrame, 1000);
   };
+
   await refreshStatus();
 }
 
 async function closeWebFullscreen() {
   isWebFullscreenActive = false;
+  clearInterval(fsSnapshotTimer);
   const overlay = document.getElementById('webFullscreenOverlay');
+  const video = document.getElementById('webFsVideo');
   const img = document.getElementById('webFsImg');
   overlay.style.display = 'none';
-  img.src = ''; // Abort live stream immediately
+  video.pause();
+  video.src = '';
+  img.src = '';
   
   try {
     await fetch('/api/kiosk/grid', {method: 'POST'});
