@@ -1424,6 +1424,9 @@ async function init() {
   try {
     await refreshStatus();
   } catch(e) {}
+
+  // Auto-refresh grid and camera thumbnails every 3 seconds
+  setInterval(refreshStatus, 3000);
 }
 
 document.getElementById('profileSelect').addEventListener('change', async (e) => {
