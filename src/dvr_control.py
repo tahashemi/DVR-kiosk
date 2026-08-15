@@ -1445,8 +1445,8 @@ async function init() {
     await refreshStatus();
   } catch(e) {}
 
-  // Auto-refresh grid and camera thumbnails every 3 seconds
-  setInterval(refreshStatus, 3000);
+  // Auto-refresh grid and camera thumbnails every 5 seconds (optimized for CPU/temp)
+  setInterval(refreshStatus, 5000);
 }
 
 document.getElementById('profileSelect').addEventListener('change', async (e) => {
@@ -1710,19 +1710,34 @@ def api_channel_labels_post():
     return jsonify({"ok": True})
 
 
+_SNAPSHOT_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+SNAPSHOT_TTL_SEC = 2.0
+
+
 @app.route('/api/snapshot/<dvr_key>/<int:ch>')
 @require_auth
 def api_snapshot(dvr_key, ch):
-    """One-shot JPEG snapshot for a channel, proxied from dvrwall."""
+    """One-shot JPEG snapshot for a channel, cached in memory for 2.0s to minimize CPU load."""
     if dvr_key not in dvr_config.get_dvrs():
         return "unknown dvr", 404
     if not dvr_reachable(dvr_key):
         return "dvr unreachable", 503
+    
+    key = f"{dvr_key}:{ch}"
+    now = time.time()
+    with _CACHE_LOCK:
+        cached = _SNAPSHOT_CACHE.get(key)
+        if cached and (now - cached[1] < SNAPSHOT_TTL_SEC):
+            return Response(cached[0], mimetype="image/jpeg")
+
     name = dvr_config.stream_name(dvr_key, ch)
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{WALL_HTTP_PORT}/jpeg/{name}")
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = resp.read()
+        with _CACHE_LOCK:
+            _SNAPSHOT_CACHE[key] = (data, now)
         return Response(data, mimetype="image/jpeg")
     except Exception as e:
         return str(e), 502
