@@ -522,8 +522,8 @@ HTML = """<!DOCTYPE html>
   }
   .tile:hover { border-color: var(--line-bright); }
   .tile.is-fullscreen { border: 2px solid var(--accent); box-shadow: 0 0 16px var(--accent-glow); }
-  .tile.in-profile { opacity: 0.45; filter: grayscale(0.5); }
-  .tile.in-profile:hover { opacity: 0.8; }
+  .tile.in-profile { opacity: 1; filter: none; }
+  .tile.in-profile:hover { opacity: 1; filter: none; }
 
   /* Drag handle & Touch Safety */
   .dragHandle {
