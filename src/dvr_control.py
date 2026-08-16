@@ -238,7 +238,9 @@ def launch_fullscreen(dvr, ch):
     global current_mode, fullscreen_target
     with grid_launch_lock:
         try:
-            wall.set_channels([{"dvr": dvr, "ch": ch, "mainstream": True}])
+            chans = get_all_active_channels()
+            chans.append({"dvr": dvr, "ch": ch, "mainstream": True})
+            wall.set_channels(chans)
             wall.set_fullscreen(dvr, ch, mainstream=True)
             current_mode = "fullscreen"
             fullscreen_target = {"dvr": dvr, "ch": ch}
