@@ -211,8 +211,11 @@ def get_all_roster_channels():
 
 
 def ensure_roster():
-    """Ensure dvrwall keeps all enabled channels decoded in RAM so every camera has 0ms live snapshots."""
+    """Ensure dvrwall keeps all fleet substreams (plus active mainstream if in fullscreen) decoded in RAM."""
     all_chans = get_all_roster_channels()
+    if current_mode == "fullscreen" and fullscreen_target:
+        # Keep all 20 fleet substreams running AND add the 1080p mainstream stream for the TV
+        all_chans = all_chans + [{"dvr": fullscreen_target["dvr"], "ch": fullscreen_target["ch"], "mainstream": True}]
     if all_chans:
         try:
             wall.set_channels(all_chans)
@@ -240,14 +243,14 @@ def launch_grid():
 
 
 def launch_fullscreen(dvr, ch):
-    """Switch hardware kiosk wall to 1x1 fullscreen on a single channel instantly with 0 latency."""
+    """Switch hardware kiosk wall to 1x1 1080p HD mainstream fullscreen on TV."""
     global current_mode, fullscreen_target
     with grid_launch_lock:
         try:
             current_mode = "fullscreen"
             fullscreen_target = {"dvr": dvr, "ch": ch}
             ensure_roster()
-            wall.set_fullscreen(dvr, ch, mainstream=False)
+            wall.set_fullscreen(dvr, ch, mainstream=True)
         except wall.WallError as e:
             print(f"launch_fullscreen: {e}", flush=True)
 
