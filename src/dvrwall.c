@@ -207,14 +207,17 @@ static void stream_session(struct stream *s) {
     uint8_t *bgra_buf = NULL;
     int vstream = -1;
 
+    int is_main = (strstr(s->name, "_main") != NULL);
+
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    av_dict_set(&opts, "fflags", "nobuffer+discardcorrupt", 0);
     av_dict_set(&opts, "flags", "low_delay", 0);
     av_dict_set(&opts, "analyzeduration", "500000", 0);
     av_dict_set(&opts, "probesize", "500000", 0);
     av_dict_set(&opts, "stimeout", "10000000", 0);   /* 10s socket timeout */
     av_dict_set(&opts, "max_delay", "0", 0);
+    av_dict_set(&opts, "buffer_size", is_main ? "65536" : "131072", 0);
 
     if (avformat_open_input(&fmt, s->url, NULL, &opts) < 0) goto done;
     if (avformat_find_stream_info(fmt, NULL) < 0) goto done;
@@ -229,8 +232,10 @@ static void stream_session(struct stream *s) {
     if (!codec) goto done;
     dec = avcodec_alloc_context3(codec);
     if (!dec || avcodec_parameters_to_context(dec, par) < 0) goto done;
-    dec->thread_count = 1;              /* tiny frames; threads cost more than they save */
+    dec->thread_count = is_main ? 4 : 1;              /* multi-thread 1080p mainstream for zero lag */
+    dec->thread_type = FF_THREAD_SLICE;
     dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    dec->flags2 |= AV_CODEC_FLAG2_FAST;
     if (avcodec_open2(dec, codec, NULL) < 0) goto done;
 
     int target_w = s->slot_w > 0 ? s->slot_w : THUMB_W;

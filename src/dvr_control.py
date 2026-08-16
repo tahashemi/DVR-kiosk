@@ -224,14 +224,14 @@ def launch_grid():
     global current_mode, active_channels_cache, grid_ready_at, fullscreen_target
     with grid_launch_lock:
         try:
-            ensure_roster()
+            current_mode = "grid"
+            fullscreen_target = None
             chans = profiles.get_active_channels()
             # Filter to enabled DVR channels only
             enabled_keys = set(k for k, v in dvr_config.get_dvrs().items() if v.get("enabled", True))
             filtered_chans = [c for c in chans if c.get("dvr") in enabled_keys]
+            wall.set_channels(filtered_chans if filtered_chans else chans)
             wall.set_layout(filtered_chans if filtered_chans else chans)
-            current_mode = "grid"
-            fullscreen_target = None
             active_channels_cache = list(chans)
             grid_ready_at = time.time()
         except wall.WallError as e:
