@@ -61,9 +61,9 @@
 #define NAME_MAX_LEN 96
 #define SOCK_PATH "/run/dvrwall.sock"
 #define FB_DEV "/dev/fb0"
-#define DEFAULT_FPS 6
+#define DEFAULT_FPS 5
 #define MIN_FPS 3
-#define MAX_FPS 10
+#define MAX_FPS 8
 #define THUMB_W 320
 #define THUMB_H 180
 #define HTTP_PORT 8590
@@ -291,8 +291,8 @@ static void stream_session(struct stream *s) {
             if (tnow - last_load_check > 2000) {
                 last_load_check = tnow;
                 float load = get_cpu_load_1m();
-                /* If 4-core SBC is under heavy load (>80% / loadavg > 3.2), skip non-reference frames */
-                dec->skip_frame = (load > 3.2f) ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+                /* If 4-core SBC load is above ~55% (loadavg > 2.2), skip non-reference frames */
+                dec->skip_frame = (load > 2.2f) ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
             }
         }
 
