@@ -207,13 +207,7 @@ def grid_watchdog():
 
 def get_all_roster_channels():
     """All enabled channels across all DVRs in the system."""
-    res = []
-    for dvr_key, dvr_info in dvr_config.get_dvrs().items():
-        if not dvr_info.get("enabled", True):
-            continue
-        for ch in dvr_config.channels_for_dvr(dvr_key):
-            res.append({"dvr": dvr_key, "ch": ch})
-    return res
+    return [{"dvr": k, "ch": c, "mainstream": False} for k, c in dvr_config.all_channels(enabled_only=True)]
 
 
 def ensure_roster():
