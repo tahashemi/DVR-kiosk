@@ -1059,32 +1059,31 @@ async function fullscreen(dvr, ch) {
   
   title.textContent = label + ' (HD Mainstream)';
   overlay.style.display = 'flex';
+  video.style.display = 'none';
+  img.style.display = 'block';
   
-  // 1. Tell Kiosk Wall to switch hardware output to mainstream
-  try {
-    await fetch('/api/kiosk/fullscreen', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({dvr, ch})
-    });
-    setStatus('Fullscreen: ' + label);
-  } catch(e) {}
+  // 1. Instantly display live HD frame (<150ms instant response)
+  img.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
+  
+  // 2. Tell Kiosk Wall to switch hardware TV output to mainstream asynchronously
+  fetch('/api/kiosk/fullscreen', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({dvr, ch})
+  }).then(() => setStatus('Kiosk showing ' + label)).catch(() => {});
 
-  // 2. Connect live H.264 video stream first (smooth real-time video)
-  video.style.display = 'block';
-  img.style.display = 'none';
-  video.src = '/api/stream/' + dvr + '/' + ch + '/main.mp4';
-  
-  video.onerror = () => {
-    // If MP4 live video stream encounters an error, fallback to rapid 1-second HD snapshot polling
-    video.style.display = 'none';
-    img.style.display = 'block';
-    const updateFsFrame = () => {
-      img.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
+  // 3. Smooth flicker-free double-buffered live refresh loop (500ms interval)
+  clearInterval(fsSnapshotTimer);
+  const updateFsFrame = () => {
+    if (!isWebFullscreenActive) return;
+    const nextImg = new Image();
+    nextImg.onload = () => {
+      if (isWebFullscreenActive) {
+        img.src = nextImg.src;
+      }
     };
-    updateFsFrame();
-    clearInterval(fsSnapshotTimer);
-    fsSnapshotTimer = setInterval(updateFsFrame, 1000);
+    nextImg.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
   };
+  fsSnapshotTimer = setInterval(updateFsFrame, 500);
 
   await refreshStatus();
 }
@@ -1723,6 +1722,7 @@ SNAPSHOT_TTL_SEC = 2.0
 
 
 @app.route('/api/snapshot/<dvr_key>/<int:ch>')
+@app.route('/api/snapshot/<dvr_key>/<int:ch>.jpg')
 @require_auth
 def api_snapshot(dvr_key, ch):
     """One-shot JPEG snapshot for a channel, cached in memory for 2.0s to minimize CPU load."""
@@ -1739,9 +1739,21 @@ def api_snapshot(dvr_key, ch):
             return Response(cached[0], mimetype="image/jpeg")
 
     name = dvr_config.stream_name(dvr_key, ch)
+    # 1. Fast path: dvrwall shared memory JPEG cache (for channels in kiosk grid)
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{WALL_HTTP_PORT}/jpeg/{name}")
-        with urllib.request.urlopen(req, timeout=4) as resp:
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            data = resp.read()
+        with _CACHE_LOCK:
+            _SNAPSHOT_CACHE[key] = (data, now)
+        return Response(data, mimetype="image/jpeg")
+    except Exception:
+        pass
+
+    # 2. Fallback: go2rtc frame API (for pool channels not currently in kiosk grid)
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{GO2RTC_HTTP_PORT}/api/frame.jpeg?src={name}")
+        with urllib.request.urlopen(req, timeout=3) as resp:
             data = resp.read()
         with _CACHE_LOCK:
             _SNAPSHOT_CACHE[key] = (data, now)
