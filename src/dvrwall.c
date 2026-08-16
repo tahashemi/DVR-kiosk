@@ -801,10 +801,23 @@ static int jpeg_encode(struct jpeg_enc *je, const uint8_t *bgra, int w, int h, u
  * same channel) cost nothing extra -- they just read the cached bytes. */
 static void *thumb_encoder_thread(void *arg) {
     (void)arg;
-    struct jpeg_enc je = {0};
-    if (jpeg_enc_init(&je, THUMB_W, THUMB_H) < 0) { logmsg("thumb: jpeg encoder init failed"); return NULL; }
-    uint8_t *scratch = av_malloc((size_t)THUMB_W * THUMB_H * 4);
-    if (!scratch) { jpeg_enc_free(&je); return NULL; }
+    struct jpeg_enc je_thumb = {0};
+    struct jpeg_enc je_main = {0};
+    if (jpeg_enc_init(&je_thumb, THUMB_W, THUMB_H) < 0) { logmsg("thumb: jpeg encoder init failed"); return NULL; }
+    
+    int main_w = FB.w > 0 ? FB.w : 1280;
+    int main_h = FB.h > 0 ? FB.h : 720;
+    jpeg_enc_init(&je_main, main_w, main_h);
+
+    uint8_t *scratch_thumb = av_malloc((size_t)THUMB_W * THUMB_H * 4);
+    uint8_t *scratch_main = av_malloc((size_t)main_w * main_h * 4);
+    if (!scratch_thumb || !scratch_main) {
+        if (scratch_thumb) av_free(scratch_thumb);
+        if (scratch_main) av_free(scratch_main);
+        jpeg_enc_free(&je_thumb);
+        jpeg_enc_free(&je_main);
+        return NULL;
+    }
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
@@ -821,15 +834,26 @@ static void *thumb_encoder_thread(void *arg) {
             pthread_mutex_lock(&s->lock);
             int have = s->have_frame;
             int64_t requested = s->requested_ms;
-            uint8_t *src = s->thumb_slot ? s->thumb_slot : s->slot;
-            if (have && src) memcpy(scratch, src, (size_t)THUMB_W * THUMB_H * 4);
+            int is_main = (strstr(s->name, "_main") != NULL);
+            int enc_w = is_main ? (s->slot_w > 0 ? s->slot_w : main_w) : THUMB_W;
+            int enc_h = is_main ? (s->slot_h > 0 ? s->slot_h : main_h) : THUMB_H;
+            uint8_t *src = is_main ? s->slot : (s->thumb_slot ? s->thumb_slot : s->slot);
+            uint8_t *scratch = is_main ? scratch_main : scratch_thumb;
+
+            if (have && src && scratch) memcpy(scratch, src, (size_t)enc_w * enc_h * 4);
             pthread_mutex_unlock(&s->lock);
-            if (!have || !src) continue;
+            if (!have || !src || !scratch) continue;
 
             if (requested == 0 || tick_now - requested > DEMAND_WINDOW_MS) continue;
 
             uint8_t *jpg = NULL; int jlen = 0;
-            if (jpeg_encode(&je, scratch, THUMB_W, THUMB_H, &jpg, &jlen) != 0) continue;
+            struct jpeg_enc *enc = is_main ? &je_main : &je_thumb;
+            if (!enc->ctx || enc->ctx->width != enc_w || enc->ctx->height != enc_h) {
+                jpeg_enc_free(enc);
+                memset(enc, 0, sizeof *enc);
+                if (jpeg_enc_init(enc, enc_w, enc_h) < 0) continue;
+            }
+            if (jpeg_encode(enc, scratch, enc_w, enc_h, &jpg, &jlen) != 0) continue;
 
             pthread_mutex_lock(&ROSTER_LOCK);
             if (ROSTER_GEN == gen && STREAMS[i].used) {
@@ -849,8 +873,10 @@ static void *thumb_encoder_thread(void *arg) {
         while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
-    av_free(scratch);
-    jpeg_enc_free(&je);
+    av_free(scratch_thumb);
+    av_free(scratch_main);
+    jpeg_enc_free(&je_thumb);
+    jpeg_enc_free(&je_main);
     return NULL;
 }
 
@@ -877,8 +903,7 @@ static int roster_copy_jpeg(const char *name, uint8_t **out, int *outlen) {
  * synchronous encode straight from the raw decoded slot. */
 static int roster_get_jpeg(const char *name, struct jpeg_enc *fallback_je,
                             uint8_t **out, int *outlen) {
-    int is_main = (strstr(name, "_main") != NULL);
-    if (!is_main && roster_copy_jpeg(name, out, outlen) == 0) return 0;
+    if (roster_copy_jpeg(name, out, outlen) == 0) return 0;
 
     pthread_mutex_lock(&ROSTER_LOCK);
     int idx = roster_find_locked(name);
@@ -887,8 +912,9 @@ static int roster_get_jpeg(const char *name, struct jpeg_enc *fallback_je,
     pthread_mutex_lock(&s->lock);
     s->requested_ms = now_ms();
     int have = s->have_frame;
-    int src_w = is_main ? (s->slot_w > 0 ? s->slot_w : 1920) : THUMB_W;
-    int src_h = is_main ? (s->slot_h > 0 ? s->slot_h : 1080) : THUMB_H;
+    int is_main = (strstr(s->name, "_main") != NULL);
+    int src_w = is_main ? (s->slot_w > 0 ? s->slot_w : 1280) : THUMB_W;
+    int src_h = is_main ? (s->slot_h > 0 ? s->slot_h : 720) : THUMB_H;
     uint8_t *src = (is_main && s->slot) ? s->slot : (s->thumb_slot ? s->thumb_slot : s->slot);
     uint8_t *scratch = NULL;
     if (have && src && src_w > 0 && src_h > 0) {

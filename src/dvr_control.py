@@ -1048,6 +1048,7 @@ function setStatus(msg) {
 }
 
 /* ---- Synchronized Mainstream Fullscreen (Live Smooth Video) ---- */
+let isWebFullscreenActive = false;
 let fsSnapshotTimer = null;
 
 async function fullscreen(dvr, ch) {
@@ -1064,16 +1065,16 @@ async function fullscreen(dvr, ch) {
   video.style.display = 'none';
   img.style.display = 'block';
   
-  // 1. Instantly display live 1080p HD frame from dvrwall memory (<50ms)
-  img.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
-  
-  // 2. Tell Kiosk Wall to switch hardware TV output to 1080p mainstream
+  // 1. Tell Kiosk Wall to switch hardware TV output to 1080p mainstream immediately
   fetch('/api/kiosk/fullscreen', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({dvr, ch})
-  }).then(() => setStatus('Kiosk showing ' + label + ' (1080p HD)')).catch(() => {});
+  }).then(() => setStatus('Kiosk showing ' + label + ' (HD Mainstream)')).catch(() => {});
 
-  // 3. Smooth double-buffered live refresh loop (400ms interval) for 1080p HD
+  // 2. Instantly display live 1080p HD frame from dvrwall memory (<50ms)
+  img.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
+
+  // 3. Smooth double-buffered live refresh loop (300ms interval) for 1080p HD
   clearInterval(fsSnapshotTimer);
   const updateFsFrame = () => {
     if (!isWebFullscreenActive) return;
@@ -1085,7 +1086,7 @@ async function fullscreen(dvr, ch) {
     };
     nextImg.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
   };
-  fsSnapshotTimer = setInterval(updateFsFrame, 400);
+  fsSnapshotTimer = setInterval(updateFsFrame, 300);
 
   await refreshStatus();
 }
@@ -1810,7 +1811,7 @@ def api_stream_main_jpg(dvr_key, ch):
     # 1. Fast path: dvrwall live memory JPEG cache (0ms lag, matches TV output exactly)
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{WALL_HTTP_PORT}/jpeg/{stream_id}")
-        with urllib.request.urlopen(req, timeout=1.0) as resp:
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
             data = resp.read()
         resp_obj = Response(data, mimetype='image/jpeg')
         resp_obj.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -1822,7 +1823,7 @@ def api_stream_main_jpg(dvr_key, ch):
     sub_id = dvr_config.stream_name(dvr_key, ch, mainstream=False)
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{WALL_HTTP_PORT}/jpeg/{sub_id}")
-        with urllib.request.urlopen(req, timeout=0.5) as resp:
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
             data = resp.read()
         resp_obj = Response(data, mimetype='image/jpeg')
         resp_obj.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
