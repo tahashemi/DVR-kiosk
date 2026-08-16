@@ -210,8 +210,8 @@ static void stream_session(struct stream *s) {
     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
     av_dict_set(&opts, "fflags", "nobuffer", 0);
     av_dict_set(&opts, "flags", "low_delay", 0);
-    av_dict_set(&opts, "analyzeduration", "0", 0);
-    av_dict_set(&opts, "probesize", "32768", 0);
+    av_dict_set(&opts, "analyzeduration", "500000", 0);
+    av_dict_set(&opts, "probesize", "500000", 0);
     av_dict_set(&opts, "stimeout", "10000000", 0);   /* 10s socket timeout */
     av_dict_set(&opts, "max_delay", "0", 0);
 
