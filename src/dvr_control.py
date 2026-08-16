@@ -1059,21 +1059,21 @@ async function fullscreen(dvr, ch) {
   const video = document.getElementById('webFsVideo');
   const img = document.getElementById('webFsImg');
   
-  title.textContent = label + ' (Live)';
+  title.textContent = label + ' (HD Mainstream)';
   overlay.style.display = 'flex';
   video.style.display = 'none';
   img.style.display = 'block';
   
-  // 1. Instantly display live snapshot from dvrwall RAM (<50ms)
-  img.src = '/api/snapshot/' + dvr + '/' + ch + '?t=' + Date.now();
+  // 1. Instantly display live 1080p HD frame from dvrwall memory (<50ms)
+  img.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
   
-  // 2. Tell Kiosk Wall to switch hardware TV output to fullscreen instantly (0 delay)
+  // 2. Tell Kiosk Wall to switch hardware TV output to 1080p mainstream
   fetch('/api/kiosk/fullscreen', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({dvr, ch})
-  }).then(() => setStatus('Kiosk showing ' + label)).catch(() => {});
+  }).then(() => setStatus('Kiosk showing ' + label + ' (1080p HD)')).catch(() => {});
 
-  // 3. Smooth flicker-free double-buffered live refresh loop (300ms interval)
+  // 3. Smooth double-buffered live refresh loop (400ms interval) for 1080p HD
   clearInterval(fsSnapshotTimer);
   const updateFsFrame = () => {
     if (!isWebFullscreenActive) return;
@@ -1083,9 +1083,9 @@ async function fullscreen(dvr, ch) {
         img.src = nextImg.src;
       }
     };
-    nextImg.src = '/api/snapshot/' + dvr + '/' + ch + '?t=' + Date.now();
+    nextImg.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
   };
-  fsSnapshotTimer = setInterval(updateFsFrame, 300);
+  fsSnapshotTimer = setInterval(updateFsFrame, 400);
 
   await refreshStatus();
 }

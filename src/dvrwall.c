@@ -740,35 +740,35 @@ struct jpeg_enc {
     int64_t pts;
 };
 
-static int jpeg_enc_init(struct jpeg_enc *je) {
+static int jpeg_enc_init(struct jpeg_enc *je, int w, int h) {
     const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
     if (!codec) return -1;
     je->ctx = avcodec_alloc_context3(codec);
     if (!je->ctx) return -1;
-    je->ctx->width = THUMB_W;
-    je->ctx->height = THUMB_H;
+    je->ctx->width = w;
+    je->ctx->height = h;
     je->ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
     je->ctx->time_base = (AVRational){1, 25};
     je->ctx->color_range = AVCOL_RANGE_JPEG;
     if (avcodec_open2(je->ctx, codec, NULL) < 0) return -1;
 
-    je->sws = sws_getContext(THUMB_W, THUMB_H, AV_PIX_FMT_BGRA,
-                             THUMB_W, THUMB_H, AV_PIX_FMT_YUVJ420P,
+    je->sws = sws_getContext(w, h, AV_PIX_FMT_BGRA,
+                             w, h, AV_PIX_FMT_YUVJ420P,
                              SWS_FAST_BILINEAR, NULL, NULL, NULL);
     je->yuv = av_frame_alloc();
-    int need = av_image_get_buffer_size(AV_PIX_FMT_YUVJ420P, THUMB_W, THUMB_H, 1);
+    int need = av_image_get_buffer_size(AV_PIX_FMT_YUVJ420P, w, h, 1);
     je->yuv_buf = av_malloc(need);
     av_image_fill_arrays(je->yuv->data, je->yuv->linesize, je->yuv_buf,
-                         AV_PIX_FMT_YUVJ420P, THUMB_W, THUMB_H, 1);
-    je->yuv->width = THUMB_W;
-    je->yuv->height = THUMB_H;
+                         AV_PIX_FMT_YUVJ420P, w, h, 1);
+    je->yuv->width = w;
+    je->yuv->height = h;
     je->yuv->format = AV_PIX_FMT_YUVJ420P;
     je->pkt = av_packet_alloc();
     return (je->sws && je->yuv && je->yuv_buf && je->pkt) ? 0 : -1;
 }
 
 static void jpeg_enc_free(struct jpeg_enc *je) {
-    if (je->sws) sws_freeContext(je->sws);
+    if (je->sws) { sws_freeContext(je->sws); je->sws = NULL; }
     if (je->yuv_buf) av_freep(&je->yuv_buf);
     if (je->yuv) av_frame_free(&je->yuv);
     if (je->pkt) av_packet_free(&je->pkt);
@@ -777,10 +777,10 @@ static void jpeg_enc_free(struct jpeg_enc *je) {
 
 /* Encode one BGRA slot to a JPEG buffer. Returns malloc'd data (caller frees
  * with av_free) via *out, length via *outlen. 0 on success. */
-static int jpeg_encode(struct jpeg_enc *je, const uint8_t *bgra, uint8_t **out, int *outlen) {
+static int jpeg_encode(struct jpeg_enc *je, const uint8_t *bgra, int w, int h, uint8_t **out, int *outlen) {
     uint8_t *planes[1] = { (uint8_t *)bgra };
-    int stride[1] = { THUMB_W * 4 };
-    sws_scale(je->sws, (const uint8_t *const *)planes, stride, 0, THUMB_H,
+    int stride[1] = { w * 4 };
+    sws_scale(je->sws, (const uint8_t *const *)planes, stride, 0, h,
               je->yuv->data, je->yuv->linesize);
     je->yuv->pts = je->pts++;   /* must strictly increase or send_frame errors */
     int r = avcodec_send_frame(je->ctx, je->yuv);
@@ -798,19 +798,11 @@ static int jpeg_encode(struct jpeg_enc *je, const uint8_t *bgra, uint8_t **out, 
 /* Background thread: encodes every roster channel's current frame to JPEG
  * once per tick and caches it on the stream, so any number of HTTP viewers
  * (grid tile + pool tile + multiple browser tabs, all possibly watching the
- * same channel) cost nothing extra -- they just read the cached bytes.
- *
- * ROSTER_LOCK is only held for brief O(1) checks here, never across the
- * (slow, ~ms-scale) encode itself -- holding it for the whole 28-channel
- * pass serialised every HTTP reader behind the encoder and collapsed
- * measured throughput to under 1fps with ~40 concurrent viewers. ROSTER_GEN
- * detects the rare case where roster_set() reassigns this index to a
- * different channel mid-encode, so a stale result is dropped instead of
- * corrupting the new channel's cache. */
+ * same channel) cost nothing extra -- they just read the cached bytes. */
 static void *thumb_encoder_thread(void *arg) {
     (void)arg;
     struct jpeg_enc je = {0};
-    if (jpeg_enc_init(&je) < 0) { logmsg("thumb: jpeg encoder init failed"); return NULL; }
+    if (jpeg_enc_init(&je, THUMB_W, THUMB_H) < 0) { logmsg("thumb: jpeg encoder init failed"); return NULL; }
     uint8_t *scratch = av_malloc((size_t)THUMB_W * THUMB_H * 4);
     if (!scratch) { jpeg_enc_free(&je); return NULL; }
 
@@ -833,16 +825,11 @@ static void *thumb_encoder_thread(void *arg) {
             if (have && src) memcpy(scratch, src, (size_t)THUMB_W * THUMB_H * 4);
             pthread_mutex_unlock(&s->lock);
             if (!have || !src) continue;
-            /* Nobody's asked for this channel recently -- decoding stays on
-             * (cheap, and needed for the TV grid regardless), but skip the
-             * JPEG encode. This is what keeps an idle dashboard from paying
-             * continuous encode cost for channels nobody is looking at;
-             * roster_get_jpeg's synchronous fallback covers the next time
-             * someone actually opens it. */
+
             if (requested == 0 || tick_now - requested > DEMAND_WINDOW_MS) continue;
 
             uint8_t *jpg = NULL; int jlen = 0;
-            if (jpeg_encode(&je, scratch, &jpg, &jlen) != 0) continue;
+            if (jpeg_encode(&je, scratch, THUMB_W, THUMB_H, &jpg, &jlen) != 0) continue;
 
             pthread_mutex_lock(&ROSTER_LOCK);
             if (ROSTER_GEN == gen && STREAMS[i].used) {
@@ -868,11 +855,7 @@ static void *thumb_encoder_thread(void *arg) {
 }
 
 /* Copy the cached JPEG for a channel and mark it as currently wanted (so
- * thumb_encoder_thread keeps refreshing it -- see DEMAND_WINDOW_MS). Returns
- * -1 if the channel isn't in the roster, or has no cached JPEG yet (either
- * genuinely no frame decoded yet, or it's an idle channel the encoder has
- * stopped refreshing; caller falls back to a one-off synchronous encode in
- * that case, see roster_get_jpeg). */
+ * thumb_encoder_thread keeps refreshing it -- see DEMAND_WINDOW_MS). */
 static int roster_copy_jpeg(const char *name, uint8_t **out, int *outlen) {
     pthread_mutex_lock(&ROSTER_LOCK);
     int idx = roster_find_locked(name);
@@ -890,14 +873,12 @@ static int roster_copy_jpeg(const char *name, uint8_t **out, int *outlen) {
     return ok;
 }
 
-/* Cache hit -> free. Cache miss (channel just came under demand, or the
- * encoder hasn't caught up yet) -> one-off synchronous encode straight from
- * the raw decoded slot, using a connection-local encoder passed in by the
- * caller. Keeps first-view latency low without paying continuous per-viewer
- * encode cost once the shared cache is warm. */
+/* Cache hit -> free. Cache miss or high-resolution mainstream request ->
+ * synchronous encode straight from the raw decoded slot. */
 static int roster_get_jpeg(const char *name, struct jpeg_enc *fallback_je,
                             uint8_t **out, int *outlen) {
-    if (roster_copy_jpeg(name, out, outlen) == 0) return 0;
+    int is_main = (strstr(name, "_main") != NULL);
+    if (!is_main && roster_copy_jpeg(name, out, outlen) == 0) return 0;
 
     pthread_mutex_lock(&ROSTER_LOCK);
     int idx = roster_find_locked(name);
@@ -906,19 +887,25 @@ static int roster_get_jpeg(const char *name, struct jpeg_enc *fallback_je,
     pthread_mutex_lock(&s->lock);
     s->requested_ms = now_ms();
     int have = s->have_frame;
+    int src_w = is_main ? (s->slot_w > 0 ? s->slot_w : 1920) : THUMB_W;
+    int src_h = is_main ? (s->slot_h > 0 ? s->slot_h : 1080) : THUMB_H;
+    uint8_t *src = (is_main && s->slot) ? s->slot : (s->thumb_slot ? s->thumb_slot : s->slot);
     uint8_t *scratch = NULL;
-    uint8_t *src = s->thumb_slot ? s->thumb_slot : s->slot;
-    if (have && src) {
-        scratch = av_malloc((size_t)THUMB_W * THUMB_H * 4);
-        if (scratch) memcpy(scratch, src, (size_t)THUMB_W * THUMB_H * 4);
+    if (have && src && src_w > 0 && src_h > 0) {
+        scratch = av_malloc((size_t)src_w * src_h * 4);
+        if (scratch) memcpy(scratch, src, (size_t)src_w * src_h * 4);
     }
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_unlock(&ROSTER_LOCK);
 
     if (!scratch) return -1;   /* known channel, but nothing decoded yet */
 
-    if (!fallback_je->ctx && jpeg_enc_init(fallback_je) < 0) { av_free(scratch); return -1; }
-    int r = jpeg_encode(fallback_je, scratch, out, outlen);
+    if (!fallback_je->ctx || fallback_je->ctx->width != src_w || fallback_je->ctx->height != src_h) {
+        jpeg_enc_free(fallback_je);
+        memset(fallback_je, 0, sizeof *fallback_je);
+        if (jpeg_enc_init(fallback_je, src_w, src_h) < 0) { av_free(scratch); return -1; }
+    }
+    int r = jpeg_encode(fallback_je, scratch, src_w, src_h, out, outlen);
     av_free(scratch);
     return r;
 }
