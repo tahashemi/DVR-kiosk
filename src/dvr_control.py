@@ -219,6 +219,27 @@ def grid_watchdog():
         time.sleep(10)
 
 
+def get_all_roster_channels():
+    """All enabled channels across all DVRs in the system."""
+    res = []
+    for dvr_key, dvr_info in dvr_config.get_dvrs().items():
+        if not dvr_info.get("enabled", True):
+            continue
+        for ch in dvr_config.channels_for_dvr(dvr_key):
+            res.append({"dvr": dvr_key, "ch": ch})
+    return res
+
+
+def ensure_roster():
+    """Ensure dvrwall keeps all enabled channels decoded in RAM so every camera has 0ms live snapshots."""
+    all_chans = get_all_roster_channels()
+    if all_chans:
+        try:
+            wall.set_channels(all_chans)
+        except wall.WallError as e:
+            print(f"ensure_roster: {e}", flush=True)
+
+
 def launch_grid():
     """(Re)build the hardware kiosk wall grid from the active profile's channels."""
     global current_mode, active_channels_cache, grid_ready_at, fullscreen_target
@@ -226,11 +247,11 @@ def launch_grid():
         try:
             current_mode = "grid"
             fullscreen_target = None
+            ensure_roster()
             chans = profiles.get_active_channels()
             # Filter to enabled DVR channels only
             enabled_keys = set(k for k, v in dvr_config.get_dvrs().items() if v.get("enabled", True))
             filtered_chans = [c for c in chans if c.get("dvr") in enabled_keys]
-            wall.set_channels(filtered_chans if filtered_chans else chans)
             wall.set_layout(filtered_chans if filtered_chans else chans)
             active_channels_cache = list(chans)
             grid_ready_at = time.time()
@@ -239,16 +260,14 @@ def launch_grid():
 
 
 def launch_fullscreen(dvr, ch):
-    """Switch hardware kiosk wall to 1x1 720p/1080p mainstream fullscreen on a single channel."""
+    """Switch hardware kiosk wall to 1x1 fullscreen on a single channel instantly with 0 latency."""
     global current_mode, fullscreen_target
     with grid_launch_lock:
         try:
             current_mode = "fullscreen"
             fullscreen_target = {"dvr": dvr, "ch": ch}
-            target = [{"dvr": dvr, "ch": ch, "mainstream": True}]
-            wall.set_channels(target)
-            wall.set_layout(target)
-            wall.set_fullscreen(dvr, ch, mainstream=True)
+            ensure_roster()
+            wall.set_fullscreen(dvr, ch, mainstream=False)
         except wall.WallError as e:
             print(f"launch_fullscreen: {e}", flush=True)
 
@@ -1057,21 +1076,21 @@ async function fullscreen(dvr, ch) {
   const video = document.getElementById('webFsVideo');
   const img = document.getElementById('webFsImg');
   
-  title.textContent = label + ' (HD Mainstream)';
+  title.textContent = label + ' (Live)';
   overlay.style.display = 'flex';
   video.style.display = 'none';
   img.style.display = 'block';
   
-  // 1. Instantly display live HD frame (<150ms instant response)
-  img.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
+  // 1. Instantly display live snapshot from dvrwall RAM (<50ms)
+  img.src = '/api/snapshot/' + dvr + '/' + ch + '?t=' + Date.now();
   
-  // 2. Tell Kiosk Wall to switch hardware TV output to mainstream asynchronously
+  // 2. Tell Kiosk Wall to switch hardware TV output to fullscreen instantly (0 delay)
   fetch('/api/kiosk/fullscreen', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({dvr, ch})
   }).then(() => setStatus('Kiosk showing ' + label)).catch(() => {});
 
-  // 3. Smooth flicker-free double-buffered live refresh loop (500ms interval)
+  // 3. Smooth flicker-free double-buffered live refresh loop (300ms interval)
   clearInterval(fsSnapshotTimer);
   const updateFsFrame = () => {
     if (!isWebFullscreenActive) return;
@@ -1081,9 +1100,9 @@ async function fullscreen(dvr, ch) {
         img.src = nextImg.src;
       }
     };
-    nextImg.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
+    nextImg.src = '/api/snapshot/' + dvr + '/' + ch + '?t=' + Date.now();
   };
-  fsSnapshotTimer = setInterval(updateFsFrame, 500);
+  fsSnapshotTimer = setInterval(updateFsFrame, 300);
 
   await refreshStatus();
 }
