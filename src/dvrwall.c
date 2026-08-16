@@ -61,9 +61,9 @@
 #define NAME_MAX_LEN 96
 #define SOCK_PATH "/run/dvrwall.sock"
 #define FB_DEV "/dev/fb0"
-#define DEFAULT_FPS 8
-#define MIN_FPS 4
-#define MAX_FPS 12
+#define DEFAULT_FPS 6
+#define MIN_FPS 3
+#define MAX_FPS 10
 #define THUMB_W 320
 #define THUMB_H 180
 #define HTTP_PORT 8590
@@ -266,10 +266,21 @@ static void stream_session(struct stream *s) {
     s->connected = 1;
     logmsg("stream[%s]: connected (%dx%d)", s->name, target_w, target_h);
 
+    int64_t last_load_check = 0;
     while (RUN && s->running) {
         int r = av_read_frame(fmt, pkt);
         if (r < 0) break;
         if (pkt->stream_index != vstream) { av_packet_unref(pkt); continue; }
+
+        if (!is_main) {
+            int64_t tnow = now_ms();
+            if (tnow - last_load_check > 2000) {
+                last_load_check = tnow;
+                float load = get_cpu_load_1m();
+                /* If 4-core SBC is under heavy load (>80% / loadavg > 3.2), skip non-reference frames */
+                dec->skip_frame = (load > 3.2f) ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+            }
+        }
 
         r = avcodec_send_packet(dec, pkt);
         av_packet_unref(pkt);
@@ -279,7 +290,8 @@ static void stream_session(struct stream *s) {
             if (!sws) {
                 sws = sws_getContext(dec->width, dec->height, dec->pix_fmt,
                                      target_w, target_h, AV_PIX_FMT_BGRA,
-                                     SWS_BILINEAR, NULL, NULL, NULL);
+                                     is_main ? SWS_BILINEAR : SWS_FAST_BILINEAR,
+                                     NULL, NULL, NULL);
                 if (!sws) { av_frame_unref(frame); goto done; }
             }
 
