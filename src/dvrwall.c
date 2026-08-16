@@ -805,12 +805,10 @@ static void *thumb_encoder_thread(void *arg) {
     struct jpeg_enc je_main = {0};
     if (jpeg_enc_init(&je_thumb, THUMB_W, THUMB_H) < 0) { logmsg("thumb: jpeg encoder init failed"); return NULL; }
     
-    int main_w = FB.w > 0 ? FB.w : 1280;
-    int main_h = FB.h > 0 ? FB.h : 720;
-    jpeg_enc_init(&je_main, main_w, main_h);
+    jpeg_enc_init(&je_main, 1920, 1080);
 
     uint8_t *scratch_thumb = av_malloc((size_t)THUMB_W * THUMB_H * 4);
-    uint8_t *scratch_main = av_malloc((size_t)main_w * main_h * 4);
+    uint8_t *scratch_main = av_malloc((size_t)1920 * 1080 * 4);
     if (!scratch_thumb || !scratch_main) {
         if (scratch_thumb) av_free(scratch_thumb);
         if (scratch_main) av_free(scratch_main);
@@ -835,8 +833,10 @@ static void *thumb_encoder_thread(void *arg) {
             int have = s->have_frame;
             int64_t requested = s->requested_ms;
             int is_main = (strstr(s->name, "_main") != NULL);
-            int enc_w = is_main ? (s->slot_w > 0 ? s->slot_w : main_w) : THUMB_W;
-            int enc_h = is_main ? (s->slot_h > 0 ? s->slot_h : main_h) : THUMB_H;
+            int enc_w = is_main ? (s->slot_w > 0 ? s->slot_w : 1920) : THUMB_W;
+            int enc_h = is_main ? (s->slot_h > 0 ? s->slot_h : 1080) : THUMB_H;
+            if (enc_w > 1920) enc_w = 1920;
+            if (enc_h > 1080) enc_h = 1080;
             uint8_t *src = is_main ? s->slot : (s->thumb_slot ? s->thumb_slot : s->slot);
             uint8_t *scratch = is_main ? scratch_main : scratch_thumb;
 
