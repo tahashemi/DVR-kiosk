@@ -167,6 +167,7 @@ struct stream {
     pthread_mutex_t lock;
     uint8_t *slot;             /* BGRA buffer */
     int slot_w, slot_h;        /* Buffer width and height */
+    uint8_t *thumb_slot;       /* Fixed 320x180 BGRA buffer for HTTP JPEG encoder */
     int have_frame;
     int64_t frame_ms;          /* when the newest frame landed */
     int64_t frames;            /* total decoded+scaled, for measuring real fps */
@@ -267,10 +268,23 @@ static void stream_session(struct stream *s) {
     logmsg("stream[%s]: connected (%dx%d)", s->name, target_w, target_h);
 
     int64_t last_load_check = 0;
+    int draining = is_main ? 1 : 0;
+    int64_t stream_start_ms = now_ms();
+
     while (RUN && s->running) {
         int r = av_read_frame(fmt, pkt);
         if (r < 0) break;
         if (pkt->stream_index != vstream) { av_packet_unref(pkt); continue; }
+
+        /* Initial burst backlog drain for mainstream: skip historical non-keyframes to hit live edge */
+        if (draining) {
+            if (now_ms() - stream_start_ms > 1500) {
+                draining = 0;
+            } else if (!(pkt->flags & AV_PKT_FLAG_KEY)) {
+                av_packet_unref(pkt);
+                continue;
+            }
+        }
 
         if (!is_main) {
             int64_t tnow = now_ms();
@@ -305,6 +319,21 @@ static void stream_session(struct stream *s) {
                     memcpy(s->slot + (size_t)row * target_w * 4,
                            bgra->data[0] + (size_t)row * bgra->linesize[0],
                            (size_t)target_w * 4);
+                }
+                if (s->thumb_slot) {
+                    if (target_w == THUMB_W && target_h == THUMB_H) {
+                        memcpy(s->thumb_slot, bgra->data[0], (size_t)THUMB_W * THUMB_H * 4);
+                    } else {
+                        for (int row = 0; row < THUMB_H; row++) {
+                            int sy = row * target_h / THUMB_H;
+                            const uint32_t *src_row = (const uint32_t *)(bgra->data[0] + (size_t)sy * bgra->linesize[0]);
+                            uint32_t *dst_row = (uint32_t *)(s->thumb_slot + (size_t)row * THUMB_W * 4);
+                            for (int col = 0; col < THUMB_W; col++) {
+                                int sx = col * target_w / THUMB_W;
+                                dst_row[col] = src_row[sx];
+                            }
+                        }
+                    }
                 }
                 s->have_frame = 1;
                 s->frame_ms = now_ms();
@@ -360,6 +389,7 @@ static void roster_stop_all(void) {
             pthread_join(STREAMS[i].tid, NULL);
             free(STREAMS[i].slot);
             STREAMS[i].slot = NULL;
+            if (STREAMS[i].thumb_slot) { free(STREAMS[i].thumb_slot); STREAMS[i].thumb_slot = NULL; }
             av_freep(&STREAMS[i].jpeg);
             STREAMS[i].used = 0;
         }
@@ -416,6 +446,7 @@ static void roster_set(char urls[][URL_MAX], int n) {
         if (STREAMS[i].used && !STREAMS[i].running) {
             pthread_join(STREAMS[i].tid, NULL);
             free(STREAMS[i].slot);
+            if (STREAMS[i].thumb_slot) free(STREAMS[i].thumb_slot);
             av_freep(&STREAMS[i].jpeg);
             memset(&STREAMS[i], 0, sizeof STREAMS[i]);
         }
@@ -438,6 +469,7 @@ static void roster_set(char urls[][URL_MAX], int n) {
         s->slot_w = is_main ? (FB.w > 0 ? FB.w : 1920) : THUMB_W;
         s->slot_h = is_main ? (FB.h > 0 ? FB.h : 1080) : THUMB_H;
         s->slot = calloc(1, (size_t)s->slot_w * s->slot_h * 4);
+        s->thumb_slot = calloc(1, (size_t)THUMB_W * THUMB_H * 4);
         s->running = 1;
         s->used = 1;
         pthread_create(&s->tid, NULL, stream_thread, s);
@@ -797,9 +829,10 @@ static void *thumb_encoder_thread(void *arg) {
             pthread_mutex_lock(&s->lock);
             int have = s->have_frame;
             int64_t requested = s->requested_ms;
-            if (have && s->slot && s->slot_w == THUMB_W) memcpy(scratch, s->slot, (size_t)THUMB_W * THUMB_H * 4);
+            uint8_t *src = s->thumb_slot ? s->thumb_slot : s->slot;
+            if (have && src) memcpy(scratch, src, (size_t)THUMB_W * THUMB_H * 4);
             pthread_mutex_unlock(&s->lock);
-            if (!have || s->slot_w != THUMB_W) continue;
+            if (!have || !src) continue;
             /* Nobody's asked for this channel recently -- decoding stays on
              * (cheap, and needed for the TV grid regardless), but skip the
              * JPEG encode. This is what keeps an idle dashboard from paying
@@ -874,9 +907,10 @@ static int roster_get_jpeg(const char *name, struct jpeg_enc *fallback_je,
     s->requested_ms = now_ms();
     int have = s->have_frame;
     uint8_t *scratch = NULL;
-    if (have && s->slot && s->slot_w == THUMB_W) {
+    uint8_t *src = s->thumb_slot ? s->thumb_slot : s->slot;
+    if (have && src) {
         scratch = av_malloc((size_t)THUMB_W * THUMB_H * 4);
-        if (scratch) memcpy(scratch, s->slot, (size_t)THUMB_W * THUMB_H * 4);
+        if (scratch) memcpy(scratch, src, (size_t)THUMB_W * THUMB_H * 4);
     }
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_unlock(&ROSTER_LOCK);

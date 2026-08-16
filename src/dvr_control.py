@@ -1798,16 +1798,28 @@ def api_stream_main_mp4(dvr_key, ch):
 @app.route('/api/stream/<dvr_key>/<int:ch>/main.jpg')
 @require_auth
 def api_stream_main_jpg(dvr_key, ch):
-    """High-resolution 720p/1080p HD snapshot frame from go2rtc mainstream."""
+    """Real-time live 1080p snapshot from dvrwall memory cache (0 lag) or go2rtc."""
     if dvr_key not in dvr_config.get_dvrs():
         return "unknown dvr", 404
     if not dvr_reachable(dvr_key):
         return "dvr unreachable", 503
     
     stream_id = dvr_config.stream_name(dvr_key, ch, mainstream=True)
+    # 1. Fast path: dvrwall live memory JPEG cache (0ms lag, matches TV output exactly)
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{WALL_HTTP_PORT}/jpeg/{stream_id}")
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            data = resp.read()
+        resp_obj = Response(data, mimetype='image/jpeg')
+        resp_obj.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return resp_obj
+    except Exception:
+        pass
+
+    # 2. Fallback: go2rtc frame API
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{GO2RTC_HTTP_PORT}/api/frame.jpeg?src={stream_id}")
-        with urllib.request.urlopen(req, timeout=8) as upstream:
+        with urllib.request.urlopen(req, timeout=3) as upstream:
             data = upstream.read()
         resp = Response(data, mimetype='image/jpeg')
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
