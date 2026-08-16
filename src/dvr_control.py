@@ -145,20 +145,6 @@ def stop_streams():
         print(f"stop_streams: {e}", flush=True)
 
 
-def ensure_roster():
-    """Re-assert the active channel roster for enabled DVRs without exceeding 512MB RAM."""
-    try:
-        if current_mode == "fullscreen" and fullscreen_target:
-            chans = [{"dvr": fullscreen_target["dvr"], "ch": fullscreen_target["ch"], "mainstream": True}]
-        else:
-            chans = profiles.get_active_channels()
-            enabled_keys = set(k for k, v in dvr_config.get_dvrs().items() if v.get("enabled", True))
-            chans = [c for c in chans if c.get("dvr") in enabled_keys]
-        wall.set_channels(chans)
-    except wall.WallError as e:
-        print(f"ensure_roster: {e}", flush=True)
-
-
 _reach_cache = {}
 _reach_lock = threading.Lock()
 REACH_TTL_OK = 30
