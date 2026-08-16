@@ -223,13 +223,13 @@ static void stream_session(struct stream *s) {
 
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-    av_dict_set(&opts, "fflags", "nobuffer+discardcorrupt", 0);
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
     av_dict_set(&opts, "flags", "low_delay", 0);
-    av_dict_set(&opts, "analyzeduration", "500000", 0);
-    av_dict_set(&opts, "probesize", "500000", 0);
+    av_dict_set(&opts, "analyzeduration", is_main ? "1000000" : "500000", 0);
+    av_dict_set(&opts, "probesize", is_main ? "1000000" : "500000", 0);
     av_dict_set(&opts, "stimeout", "10000000", 0);   /* 10s socket timeout */
     av_dict_set(&opts, "max_delay", "0", 0);
-    av_dict_set(&opts, "buffer_size", is_main ? "65536" : "131072", 0);
+    av_dict_set(&opts, "buffer_size", is_main ? "1048576" : "131072", 0);
 
     if (avformat_open_input(&fmt, s->url, NULL, &opts) < 0) goto done;
     if (avformat_find_stream_info(fmt, NULL) < 0) goto done;
