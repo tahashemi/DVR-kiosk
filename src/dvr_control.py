@@ -1048,7 +1048,6 @@ function setStatus(msg) {
 }
 
 /* ---- Synchronized Mainstream Fullscreen (Live Smooth Video) ---- */
-let isWebFullscreenActive = false;
 let fsSnapshotTimer = null;
 
 async function fullscreen(dvr, ch) {
