@@ -154,7 +154,8 @@ struct stream {
     char name[NAME_MAX_LEN];   /* basename of url, e.g. "dvr1_ch1" */
 
     pthread_mutex_t lock;
-    uint8_t *slot;             /* BGRA, THUMB_W*THUMB_H*4, fixed size */
+    uint8_t *slot;             /* BGRA buffer */
+    int slot_w, slot_h;        /* Buffer width and height */
     int have_frame;
     int64_t frame_ms;          /* when the newest frame landed */
     int64_t frames;            /* total decoded+scaled, for measuring real fps */
@@ -232,19 +233,22 @@ static void stream_session(struct stream *s) {
     dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
     if (avcodec_open2(dec, codec, NULL) < 0) goto done;
 
+    int target_w = s->slot_w > 0 ? s->slot_w : THUMB_W;
+    int target_h = s->slot_h > 0 ? s->slot_h : THUMB_H;
+
     frame = av_frame_alloc();
     bgra = av_frame_alloc();
     pkt = av_packet_alloc();
     if (!frame || !bgra || !pkt) goto done;
 
-    int need = av_image_get_buffer_size(AV_PIX_FMT_BGRA, THUMB_W, THUMB_H, 1);
+    int need = av_image_get_buffer_size(AV_PIX_FMT_BGRA, target_w, target_h, 1);
     bgra_buf = av_malloc(need);
     if (!bgra_buf) goto done;
     av_image_fill_arrays(bgra->data, bgra->linesize, bgra_buf,
-                         AV_PIX_FMT_BGRA, THUMB_W, THUMB_H, 1);
+                         AV_PIX_FMT_BGRA, target_w, target_h, 1);
 
     s->connected = 1;
-    logmsg("stream[%s]: connected", s->name);
+    logmsg("stream[%s]: connected (%dx%d)", s->name, target_w, target_h);
 
     while (RUN && s->running) {
         int r = av_read_frame(fmt, pkt);
@@ -258,8 +262,8 @@ static void stream_session(struct stream *s) {
         while (avcodec_receive_frame(dec, frame) == 0) {
             if (!sws) {
                 sws = sws_getContext(dec->width, dec->height, dec->pix_fmt,
-                                     THUMB_W, THUMB_H, AV_PIX_FMT_BGRA,
-                                     SWS_FAST_BILINEAR, NULL, NULL, NULL);
+                                     target_w, target_h, AV_PIX_FMT_BGRA,
+                                     SWS_BILINEAR, NULL, NULL, NULL);
                 if (!sws) { av_frame_unref(frame); goto done; }
             }
 
@@ -269,10 +273,10 @@ static void stream_session(struct stream *s) {
             /* Overwrite, never queue -- this is what bounds latency. */
             pthread_mutex_lock(&s->lock);
             if (s->slot) {
-                for (int row = 0; row < THUMB_H; row++) {
-                    memcpy(s->slot + (size_t)row * THUMB_W * 4,
+                for (int row = 0; row < target_h; row++) {
+                    memcpy(s->slot + (size_t)row * target_w * 4,
                            bgra->data[0] + (size_t)row * bgra->linesize[0],
-                           (size_t)THUMB_W * 4);
+                           (size_t)target_w * 4);
                 }
                 s->have_frame = 1;
                 s->frame_ms = now_ms();
@@ -401,7 +405,11 @@ static void roster_set(char urls[][URL_MAX], int n) {
         pthread_mutex_init(&s->lock, NULL);
         snprintf(s->url, URL_MAX, "%s", urls[j]);
         url_basename(urls[j], s->name, sizeof s->name);
-        s->slot = calloc(1, (size_t)THUMB_W * THUMB_H * 4);
+
+        int is_main = (strstr(s->name, "_main") != NULL);
+        s->slot_w = is_main ? (FB.w > 0 ? FB.w : 1920) : THUMB_W;
+        s->slot_h = is_main ? (FB.h > 0 ? FB.h : 1080) : THUMB_H;
+        s->slot = calloc(1, (size_t)s->slot_w * s->slot_h * 4);
         s->running = 1;
         s->used = 1;
         pthread_create(&s->tid, NULL, stream_thread, s);
@@ -454,28 +462,28 @@ static void compose_set(char urls[][URL_MAX], int n) {
 
 /* ------------------------------------------------------------ compositor */
 
-/* Nearest-neighbour scale-blit from the fixed THUMB_W x THUMB_H slot into a
- * dw x dh region of the framebuffer at (dx,dy). Falls back to a straight
- * memcpy per row when sizes match (the common grid case), which is what
- * actually runs at 12fps for every tile, so it stays on the cheap path. */
-static void blit_tile(const uint8_t *slot, int dx, int dy, int dw, int dh) {
-    if (dw == THUMB_W && dh == THUMB_H) {
+/* Nearest-neighbour scale-blit from the slot into a dw x dh region of the framebuffer.
+ * Falls back to a straight memcpy per row when sizes match (the common 1080p fullscreen
+ * and grid cases), so it stays on the ultra-cheap, zero-lag memcpy path. */
+static void blit_tile(const uint8_t *slot, int slot_w, int slot_h, int dx, int dy, int dw, int dh) {
+    if (!slot || slot_w <= 0 || slot_h <= 0) return;
+    if (dw == slot_w && dh == slot_h) {
         for (int row = 0; row < dh; row++) {
             int fy = dy + row;
             if (fy < 0 || fy >= FB.h) continue;
             memcpy(FB.mem + (size_t)fy * FB.stride + (size_t)dx * 4,
-                   slot + (size_t)row * THUMB_W * 4, (size_t)dw * 4);
+                   slot + (size_t)row * slot_w * 4, (size_t)dw * 4);
         }
         return;
     }
     for (int row = 0; row < dh; row++) {
         int fy = dy + row;
         if (fy < 0 || fy >= FB.h) continue;
-        int sy = row * THUMB_H / dh;
+        int sy = row * slot_h / dh;
         uint32_t *dst = (uint32_t *)(FB.mem + (size_t)fy * FB.stride + (size_t)dx * 4);
-        const uint32_t *src = (const uint32_t *)(slot + (size_t)sy * THUMB_W * 4);
+        const uint32_t *src = (const uint32_t *)(slot + (size_t)sy * slot_w * 4);
         for (int col = 0; col < dw; col++) {
-            int sx = col * THUMB_W / dw;
+            int sx = col * slot_w / dw;
             dst[col] = src[sx];
         }
     }
@@ -502,7 +510,11 @@ static void *compositor_thread(void *arg) {
             struct stream *s = &STREAMS[c->stream_idx];
             if (!s->used) continue;
             pthread_mutex_lock(&s->lock);
-            if (s->have_frame && s->slot) blit_tile(s->slot, c->x, c->y, c->w, c->h);
+            if (s->have_frame && s->slot) {
+                int sw = s->slot_w > 0 ? s->slot_w : THUMB_W;
+                int sh = s->slot_h > 0 ? s->slot_h : THUMB_H;
+                blit_tile(s->slot, sw, sh, c->x, c->y, c->w, c->h);
+            }
             pthread_mutex_unlock(&s->lock);
         }
         pthread_mutex_unlock(&COMPOSE_LOCK);
@@ -743,9 +755,9 @@ static void *thumb_encoder_thread(void *arg) {
             pthread_mutex_lock(&s->lock);
             int have = s->have_frame;
             int64_t requested = s->requested_ms;
-            if (have && s->slot) memcpy(scratch, s->slot, (size_t)THUMB_W * THUMB_H * 4);
+            if (have && s->slot && s->slot_w == THUMB_W) memcpy(scratch, s->slot, (size_t)THUMB_W * THUMB_H * 4);
             pthread_mutex_unlock(&s->lock);
-            if (!have) continue;
+            if (!have || s->slot_w != THUMB_W) continue;
             /* Nobody's asked for this channel recently -- decoding stays on
              * (cheap, and needed for the TV grid regardless), but skip the
              * JPEG encode. This is what keeps an idle dashboard from paying
@@ -820,7 +832,7 @@ static int roster_get_jpeg(const char *name, struct jpeg_enc *fallback_je,
     s->requested_ms = now_ms();
     int have = s->have_frame;
     uint8_t *scratch = NULL;
-    if (have && s->slot) {
+    if (have && s->slot && s->slot_w == THUMB_W) {
         scratch = av_malloc((size_t)THUMB_W * THUMB_H * 4);
         if (scratch) memcpy(scratch, s->slot, (size_t)THUMB_W * THUMB_H * 4);
     }
