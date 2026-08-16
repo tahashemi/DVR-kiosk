@@ -1818,7 +1818,19 @@ def api_stream_main_jpg(dvr_key, ch):
     except Exception:
         pass
 
-    # 2. Fallback: go2rtc frame API
+    # 2. Fast fallback to live substream while mainstream is connecting
+    sub_id = dvr_config.stream_name(dvr_key, ch, mainstream=False)
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{WALL_HTTP_PORT}/jpeg/{sub_id}")
+        with urllib.request.urlopen(req, timeout=0.5) as resp:
+            data = resp.read()
+        resp_obj = Response(data, mimetype='image/jpeg')
+        resp_obj.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return resp_obj
+    except Exception:
+        pass
+
+    # 3. Fallback: go2rtc frame API
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{GO2RTC_HTTP_PORT}/api/frame.jpeg?src={stream_id}")
         with urllib.request.urlopen(req, timeout=3) as upstream:
