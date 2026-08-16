@@ -61,12 +61,23 @@
 #define NAME_MAX_LEN 96
 #define SOCK_PATH "/run/dvrwall.sock"
 #define FB_DEV "/dev/fb0"
-#define DEFAULT_FPS 12
+#define DEFAULT_FPS 8
+#define MIN_FPS 4
+#define MAX_FPS 12
 #define THUMB_W 320
 #define THUMB_H 180
 #define HTTP_PORT 8590
 #define MJPEG_FPS 5
 #define DEMAND_WINDOW_MS 3000   /* stop encoding a channel this long after its last request */
+
+static float get_cpu_load_1m(void) {
+    FILE *f = fopen("/proc/loadavg", "r");
+    if (!f) return 0.0f;
+    float l1 = 0.0f;
+    if (fscanf(f, "%f", &l1) != 1) l1 = 0.0f;
+    fclose(f);
+    return l1;
+}
 
 /* ---------------------------------------------------------------- logging */
 
@@ -498,6 +509,7 @@ static void *compositor_thread(void *arg) {
     (void)arg;
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
+    int tick = 0;
 
     while (RUN) {
         long period_ns = 1000000000L / (TARGET_FPS > 0 ? TARGET_FPS : DEFAULT_FPS);
@@ -506,6 +518,19 @@ static void *compositor_thread(void *arg) {
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
 
         if (BLANKED) continue;
+
+        /* Adaptive Framerate Governor: Check CPU load every 3 seconds */
+        if (++tick % 24 == 0) {
+            float load = get_cpu_load_1m();
+            /* On a 4-core board, load > 3.2 means > 80% CPU utilization */
+            if (load > 3.2f && TARGET_FPS > MIN_FPS) {
+                TARGET_FPS--;
+                logmsg("governor: cpu load high (%.2f > 80%%), lowered framerate to %d fps", load, TARGET_FPS);
+            } else if (load < 2.0f && TARGET_FPS < DEFAULT_FPS && NCOMPOSE > 1) {
+                TARGET_FPS++;
+                logmsg("governor: cpu load low (%.2f < 50%%), restored framerate to %d fps", load, TARGET_FPS);
+            }
+        }
 
         pthread_mutex_lock(&COMPOSE_LOCK);
         if (FB_DIRTY) { memset(FB.mem, 0, FB.len); FB_DIRTY = 0; }
