@@ -134,11 +134,7 @@ def require_auth(f):
 
 
 def get_all_active_channels():
-    chans = []
-    for k, c in dvr_config.all_channels(enabled_only=True):
-        chans.append({"dvr": k, "ch": c, "mainstream": False})
-        chans.append({"dvr": k, "ch": c, "mainstream": True})
-    return chans
+    return [{"dvr": k, "ch": c, "mainstream": False} for k, c in dvr_config.all_channels(enabled_only=True)]
 
 
 def stop_streams():
@@ -242,7 +238,8 @@ def launch_fullscreen(dvr, ch):
     global current_mode, fullscreen_target
     with grid_launch_lock:
         try:
-            ensure_roster()
+            wall.set_channels([{"dvr": dvr, "ch": ch, "mainstream": True}])
+            time.sleep(0.1)
             wall.set_fullscreen(dvr, ch, mainstream=True)
             current_mode = "fullscreen"
             fullscreen_target = {"dvr": dvr, "ch": ch}
