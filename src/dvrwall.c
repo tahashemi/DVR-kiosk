@@ -65,19 +65,8 @@
 #define THUMB_W 320
 #define THUMB_H 180
 #define HTTP_PORT 8590
-#define MJPEG_FPS_THUMB 3   /* grid/pool thumbnails -- 320x180, cheap to
-                             * re-encode; the substream source itself is
-                             * only 12fps, so there's no benefit going
-                             * higher here */
-#define MJPEG_FPS_MAIN 10   /* fullscreen HD WebUI preview -- a full
-                             * framebuffer-sized re-encode, materially more
-                             * expensive per frame than a thumbnail, so it
-                             * gets its own independently-tunable cap
-                             * instead of sharing one number with the
-                             * thumbnails. Below the 25fps mainstream
-                             * source; the TV path never goes through JPEG
-                             * at all (it blits decoded frames directly),
-                             * only this WebUI preview path does. */
+#define MJPEG_FPS_THUMB 2   /* grid/pool thumbnails -- 320x180, cheap to re-encode */
+#define MJPEG_FPS_MAIN 2    /* fullscreen HD WebUI preview -- capped to 2fps to eliminate CPU spikes */
 #define DEMAND_WINDOW_MS 3000   /* stop encoding a channel this long after its last request */
 
 /* ---------------------------------------------------------------- logging */

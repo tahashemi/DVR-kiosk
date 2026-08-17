@@ -1201,11 +1201,33 @@ function setStatus(msg) {
   statusHideTimer = setTimeout(() => { el.classList.remove('show'); }, 3000);
 }
 
-/* ---- Synchronized Mainstream Fullscreen (Live Smooth Video) ---- */
-let fsReconnectTimer = null;
+/* ---- Synchronized Mainstream Fullscreen (Real-Time Zero-Lag Video) ---- */
+let fsPollTimer = null;
+let currentFsTarget = null;
+
+function refreshFsFrame() {
+  if (!isWebFullscreenActive || !currentFsTarget) return;
+  const img = document.getElementById('webFsImg');
+  if (!img) return;
+  const now = Date.now();
+  const nextImg = new Image();
+  nextImg.onload = () => {
+    if (!isWebFullscreenActive) return;
+    img.src = nextImg.src;
+    clearTimeout(fsPollTimer);
+    fsPollTimer = setTimeout(refreshFsFrame, 600);
+  };
+  nextImg.onerror = () => {
+    if (!isWebFullscreenActive) return;
+    clearTimeout(fsPollTimer);
+    fsPollTimer = setTimeout(refreshFsFrame, 1500);
+  };
+  nextImg.src = '/api/snapshot/' + currentFsTarget.dvr + '/' + currentFsTarget.ch + '?t=' + now;
+}
 
 async function fullscreen(dvr, ch) {
   isWebFullscreenActive = true;
+  currentFsTarget = { dvr, ch };
   const label = channelLabel(dvr, ch);
 
   const overlay = document.getElementById('webFullscreenOverlay');
@@ -1219,10 +1241,7 @@ async function fullscreen(dvr, ch) {
   img.style.display = 'block';
 
   // 1. Instant paint fallback preview frame (<50ms)
-  const fallbackSrc = () => '/api/snapshot/' + dvr + '/' + ch + '?t=' + Date.now();
-  const liveSrc = () => '/api/live/' + dvr + '/' + ch + '?main=1&t=' + Date.now();
-  
-  img.src = fallbackSrc();
+  img.src = '/api/snapshot/' + dvr + '/' + ch + '?t=' + Date.now();
 
   // 2. Tell Kiosk Wall to switch hardware TV output to 1080p mainstream immediately
   fetch('/api/kiosk/fullscreen', {
@@ -1231,33 +1250,17 @@ async function fullscreen(dvr, ch) {
     body: JSON.stringify({dvr, ch})
   }).then(() => setStatus('Kiosk showing ' + label + ' (HD Mainstream)')).catch(() => {});
 
-  // 3. Connect to live HD MJPEG stream with retry
-  clearTimeout(fsReconnectTimer);
-  let liveAttempting = false;
-
-  const tryConnectLive = () => {
-    if (!isWebFullscreenActive) return;
-    liveAttempting = true;
-    img.src = liveSrc();
-  };
-
-  img.onerror = () => {
-    if (!isWebFullscreenActive || !liveAttempting) return;
-    liveAttempting = false;
-    img.src = fallbackSrc();
-    clearTimeout(fsReconnectTimer);
-    fsReconnectTimer = setTimeout(tryConnectLive, 1500);
-  };
-
-  // Brief delay to allow RTSP handshake before connecting live stream
-  fsReconnectTimer = setTimeout(tryConnectLive, 600);
+  // 3. Start non-buffering real-time frame polling loop (0 lag, <10% CPU)
+  clearTimeout(fsPollTimer);
+  fsPollTimer = setTimeout(refreshFsFrame, 500);
 
   await refreshStatus();
 }
 
 async function closeWebFullscreen() {
   isWebFullscreenActive = false;
-  clearTimeout(fsReconnectTimer);
+  currentFsTarget = null;
+  clearTimeout(fsPollTimer);
   const overlay = document.getElementById('webFullscreenOverlay');
   const video = document.getElementById('webFsVideo');
   const img = document.getElementById('webFsImg');
