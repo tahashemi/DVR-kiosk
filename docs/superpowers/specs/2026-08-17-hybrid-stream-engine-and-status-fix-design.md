@@ -17,6 +17,7 @@ The solution implements a **High-Performance Hybrid Stream Engine**:
 - **Grid & Pool**: 1.5s lightweight snapshot polling with in-place timestamp updates across all channels (28+ channels across all DVRs), eliminating socket exhaustion and DOM churn.
 - **Fullscreen**: Dedicated persistent 1080p MJPEG stream with an instant 2-tier preview placeholder (<50ms paint) and seamless live stream upgrade.
 - **Status & Roster**: DVR network reachability decoupled from dvrwall's on-screen decode roster, accurately reporting online camera counts and supporting on-demand stream demand.
+- **Adaptive FPS & CPU Load Governor**: Maximizes framerate when system load is healthy (<80% CPU / load < 3.2), automatically throttling down refresh rates and compositor FPS if load exceeds 80% to prevent judder and thermal throttling.
 
 ---
 
@@ -106,10 +107,18 @@ flowchart TD
       return { cls: 'online ready', title: 'Ready (On-Demand)', online: true, liveTv: false };
     }
     ```
-- **Accurate DVR Group Headers**:
-  - In `renderPool()`, `onlineCount` counts all channels on reachable DVRs.
-  - Headers display: `[DVR LABEL] [onlineCount]/[totalChannels] Online` (e.g. `8/8 Online`).
-  - The "Online" filter tab displays all channels whose DVRs are reachable, allowing users to view and drag any channel from any DVR into the kiosk grid.
+### 3.4 Dynamic Adaptive FPS & Load Governor (<80% Target)
+- **Real-Time Load Monitoring**: `dvr_control.py` monitors 1-minute CPU load average via `os.getloadavg()` (or `/proc/stat`). On a 4-core Raspberry Pi 4, 80% CPU corresponds to a load average of `3.2` (or 80% per-core CPU).
+- **Dynamic Throttle Rules**:
+  - **Normal / Healthy Load (<80% / Load < 3.2)**:
+    - TV Compositor: 15–20 FPS for grid; full 25 FPS for fullscreen mainstream.
+    - WebUI Fullscreen MJPEG: Up to 15 FPS.
+    - WebUI Grid & Pool Snapshots: High-cadence 1.0s–1.2s refresh.
+  - **Heavy Load (>80% / Load > 3.2)**:
+    - Step down TV Compositor target FPS via `wall.set_fps(10)` or `wall.set_fps(8)`.
+    - WebUI Grid & Pool Snapshots: Automatically throttle to 2.5s–3.0s interval.
+    - Fullscreen WebUI: Maintain single stream while shedding all background grid/pool decode demand.
+- **Hysteresis**: Load must remain below 65% for >15 seconds before scaling back up to maximum FPS to prevent oscillation.
 
 ---
 

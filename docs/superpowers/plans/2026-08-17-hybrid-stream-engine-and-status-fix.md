@@ -227,7 +227,54 @@ Expected: 0 errors.
 
 ---
 
-### Task 4: Automated Verification, Pi Deployment, and Git Sync
+### Task 4: Dynamic Adaptive FPS & CPU Load Governor (<80% Target)
+
+**Files:**
+- Modify: `DVR-KIOSK-GIT/src/dvr_control.py`
+- Modify: `DVR-KIOSK-GIT/src/wall.py`
+
+**Interfaces:**
+- Consumes: `os.getloadavg()`, `wall.set_fps(target_fps)`
+- Produces: Dynamic framerate tuning background loop `cpu_load_governor()`.
+
+- [ ] **Step 1: Implement `set_fps(fps)` in `wall.py`**
+
+```python
+def set_fps(target_fps):
+    """Dynamically adjust dvrwall compositor target FPS."""
+    return _send(f"FPS {int(target_fps)}")
+```
+
+- [ ] **Step 2: Implement `cpu_load_governor()` background worker in `dvr_control.py`**
+
+```python
+def cpu_load_governor():
+    """Dynamically scales TV compositor and WebUI polling FPS based on CPU load."""
+    current_target_fps = 15
+    while True:
+        try:
+            load1, _, _ = os.getloadavg()
+            # On 4-core Pi 4: 80% load is ~3.2
+            if load1 > 3.2:
+                if current_target_fps > 8:
+                    current_target_fps = 8
+                    wall.set_fps(current_target_fps)
+            elif load1 < 2.5:
+                if current_target_fps < 15:
+                    current_target_fps = 15
+                    wall.set_fps(current_target_fps)
+        except Exception as e:
+            pass
+        time.sleep(10)
+```
+
+- [ ] **Step 3: Start `cpu_load_governor()` in `start_background_workers()`**
+
+Ensure `threading.Thread(target=cpu_load_governor, daemon=True).start()` is spawned at startup.
+
+---
+
+### Task 5: Automated Verification, Pi Deployment, and Git Sync
 
 **Files:**
 - Deploy to: `/root/dvr_control.py` on Pi `192.168.40.99`
