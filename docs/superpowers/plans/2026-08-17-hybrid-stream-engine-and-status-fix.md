@@ -245,21 +245,30 @@ def set_fps(target_fps):
     return _send(f"FPS {int(target_fps)}")
 ```
 
-- [ ] **Step 2: Implement `cpu_load_governor()` background worker in `dvr_control.py`**
+- [ ] **Step 2: Implement universal `cpu_load_governor()` background worker in `dvr_control.py`**
 
 ```python
+def get_normalized_cpu_load_pct():
+    """Universal normalized CPU utilization across any OS and core count."""
+    try:
+        load1, _, _ = os.getloadavg()
+        cores = os.cpu_count() or 1
+        return (load1 / cores) * 100.0
+    except Exception:
+        return 0.0
+
 def cpu_load_governor():
     """Dynamically scales TV compositor and WebUI polling FPS based on CPU load."""
     current_target_fps = 15
     while True:
         try:
-            load1, _, _ = os.getloadavg()
-            # On 4-core Pi 4: 80% load is ~3.2
-            if load1 > 3.2:
+            load_pct = get_normalized_cpu_load_pct()
+            # If normalized CPU load exceeds 80% on any CPU architecture / core count
+            if load_pct > 80.0:
                 if current_target_fps > 8:
                     current_target_fps = 8
                     wall.set_fps(current_target_fps)
-            elif load1 < 2.5:
+            elif load_pct < 60.0:
                 if current_target_fps < 15:
                     current_target_fps = 15
                     wall.set_fps(current_target_fps)

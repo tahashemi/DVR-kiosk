@@ -107,15 +107,27 @@ flowchart TD
       return { cls: 'online ready', title: 'Ready (On-Demand)', online: true, liveTv: false };
     }
     ```
-### 3.4 Dynamic Adaptive FPS & Load Governor (<80% Target)
-- **Real-Time Load Monitoring**: `dvr_control.py` monitors 1-minute CPU load average via `os.getloadavg()` (or `/proc/stat`). On a 4-core Raspberry Pi 4, 80% CPU corresponds to a load average of `3.2` (or 80% per-core CPU).
+### 3.4 Dynamic Adaptive FPS & Load Governor (<80% Target, Universal / Core-Agnostic)
+- **Universal Dynamic Load Calculation**:
+  - Dynamically detects the system's active CPU core count using `os.cpu_count() or 1`.
+  - Calculates normalized percentage CPU load:
+    ```python
+    def get_normalized_cpu_load_pct():
+        try:
+            load1, _, _ = os.getloadavg()
+            cores = os.cpu_count() or 1
+            return (load1 / cores) * 100.0
+        except Exception:
+            return 0.0
+    ```
+  - Fully universal across any SBC or x86 hardware (1-core, 4-core, 8-core RK3588, or 64-core x86 servers).
 - **Dynamic Throttle Rules**:
-  - **Normal / Healthy Load (<80% / Load < 3.2)**:
-    - TV Compositor: 15–20 FPS for grid; full 25 FPS for fullscreen mainstream.
-    - WebUI Fullscreen MJPEG: Up to 15 FPS.
-    - WebUI Grid & Pool Snapshots: High-cadence 1.0s–1.2s refresh.
-  - **Heavy Load (>80% / Load > 3.2)**:
-    - Step down TV Compositor target FPS via `wall.set_fps(10)` or `wall.set_fps(8)`.
+  - **Healthy Load (<80% normalized CPU load)**:
+    - TV Compositor: Maximum framerate (15–25 FPS).
+    - WebUI Fullscreen MJPEG: Maximum framerate (10–15 FPS).
+    - WebUI Grid & Pool Snapshots: High-speed 1.0s–1.5s refresh.
+  - **Heavy Load (>80% normalized CPU load)**:
+    - Step down TV Compositor target FPS via `wall.set_fps(8)`.
     - WebUI Grid & Pool Snapshots: Automatically throttle to 2.5s–3.0s interval.
     - Fullscreen WebUI: Maintain single stream while shedding all background grid/pool decode demand.
 - **Hysteresis**: Load must remain below 65% for >15 seconds before scaling back up to maximum FPS to prevent oscillation.
