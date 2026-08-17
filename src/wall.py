@@ -75,6 +75,20 @@ def set_fullscreen(dvr_key, ch, mainstream=True):
     return _send("FULLSCREEN " + stream_url(dvr_key, ch, mainstream=mainstream))
 
 
+def set_decoding(channels):
+    """Decode only these channels; pause every other roster stream.
+
+    Pausing keeps the connection established and drained, so resuming is
+    just "start decoding again" -- no RTSP handshake, no go2rtc DVRIP
+    reconnect, no thread churn. This is what makes a fullscreen toggle
+    cheap: the grid stays connected-but-idle instead of being torn down and
+    rebuilt (16 simultaneous stream opens, which pegged all four cores and
+    drove load past 30). An empty list resumes everything."""
+    urls = [stream_url(c["dvr"], c["ch"], mainstream=c.get("mainstream", False))
+            for c in channels]
+    return _send("DECODE " + " ".join(urls) if urls else "DECODE")
+
+
 def set_fps(target_fps):
     """Dynamically set the compositor target framerate in dvrwall."""
     return _send(f"FPS {max(1, min(30, int(target_fps)))}")

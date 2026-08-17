@@ -250,43 +250,56 @@ def ensure_roster():
     24/7 whatever this sends regardless of whether anyone's looking (measured:
     ~250% of 400% CPU for a 20-channel "always decode everything" roster), so
     an idle pool costs nothing and only actually-viewed channels are paid
-    for. Fullscreen mode: ONLY that one channel's mainstream -- every
-    substream connection is dropped, so CPU/bandwidth actually goes down
-    while viewing fullscreen instead of adding a 21st stream on top of the
-    other 20 (which is also what made the TV keep showing the wrong stream:
-    dvrwall was juggling 21 concurrent connections instead of just switching
-    to the one that matters). Calling this with an unchanged channel list is
-    a cheap no-op (see roster_set()'s comment in dvrwall.c), so it's safe to
-    call it repeatedly to refresh demand -- see grid_watchdog()."""
-    if current_mode == "fullscreen" and fullscreen_target:
-        all_chans = [{
-            "dvr": fullscreen_target["dvr"],
-            "ch": fullscreen_target["ch"],
-            "mainstream": True,
-        }]
-    else:
-        wanted = set()
-        for c in (active_channels_cache or []):
-            dvr_key, ch = c.get("dvr"), c.get("ch")
-            if dvr_key is not None and ch is not None:
-                wanted.add((dvr_key, ch))
-        now = time.time()
-        with _demand_lock:
-            demanded_keys = [k for k, ts in _channel_demand.items() if now - ts < CHANNEL_DEMAND_WINDOW_SEC]
-        for key in demanded_keys:
-            dvr_key, _, ch_s = key.partition(":")
-            try:
-                wanted.add((dvr_key, int(ch_s)))
-            except ValueError:
-                continue
-        enabled = set(dvr_config.all_channels(enabled_only=True))
-        wanted &= enabled   # never roster a disabled/removed channel
-        all_chans = [{"dvr": d, "ch": c, "mainstream": False} for d, c in wanted]
+    for. Calling this with an unchanged channel list is a cheap no-op (see
+    roster_set()'s comment in dvrwall.c), so it's safe to call it repeatedly
+    to refresh demand -- see grid_watchdog().
+
+    Fullscreen mode: the grid's substreams stay *connected* and the target's
+    mainstream is added, but DECODE is narrowed to just the mainstream so
+    everything else is paused (connection alive, decode skipped). Only the
+    mainstream is decoded, so fullscreen CPU is what it was before, but a
+    toggle no longer tears down and rebuilds 16 connections. That teardown
+    was the real cost: exiting fullscreen restarted 16 streams at once --
+    16 RTSP handshakes plus avformat_find_stream_info() plus keyframe waits,
+    each also forcing go2rtc to re-establish its upstream DVRIP connection
+    -- which pegged all four cores, drove load past 30, and thermally
+    throttled the SoC to 1008MHz. Pausing costs only the packet read, and
+    resuming needs nothing but the next keyframe."""
+    wanted = set()
+    for c in (active_channels_cache or []):
+        dvr_key, ch = c.get("dvr"), c.get("ch")
+        if dvr_key is not None and ch is not None:
+            wanted.add((dvr_key, ch))
+    now = time.time()
+    with _demand_lock:
+        demanded_keys = [k for k, ts in _channel_demand.items() if now - ts < CHANNEL_DEMAND_WINDOW_SEC]
+    for key in demanded_keys:
+        dvr_key, _, ch_s = key.partition(":")
+        try:
+            wanted.add((dvr_key, int(ch_s)))
+        except ValueError:
+            continue
+    enabled = set(dvr_config.all_channels(enabled_only=True))
+    wanted &= enabled   # never roster a disabled/removed channel
+    all_chans = [{"dvr": d, "ch": c, "mainstream": False} for d, c in wanted]
+
+    fs = fullscreen_target if current_mode == "fullscreen" else None
+    if fs:
+        # Keep the grid connected (paused below) and add the HD mainstream.
+        all_chans.append({"dvr": fs["dvr"], "ch": fs["ch"], "mainstream": True})
+
     if all_chans:
         try:
             wall.set_channels(all_chans)
         except wall.WallError as e:
             print(f"ensure_roster: {e}", flush=True)
+
+    # Narrow decoding to just what's on screen. In fullscreen that's the one
+    # mainstream; in grid it's everything rostered (empty list == resume all).
+    try:
+        wall.set_decoding([all_chans[-1]] if fs else [])
+    except wall.WallError as e:
+        print(f"ensure_roster: set_decoding: {e}", flush=True)
 
 
 def launch_grid():
@@ -1253,7 +1266,12 @@ function refreshFsFrame() {
     clearTimeout(fsPollTimer);
     fsPollTimer = setTimeout(refreshFsFrame, 1500);
   };
-  nextImg.src = '/api/snapshot/' + currentFsTarget.dvr + '/' + currentFsTarget.ch + '?t=' + now;
+  // main.jpg, not /api/snapshot: while fullscreen is up the grid substreams
+  // are still rostered but paused, so they hold a stale last frame that
+  // /api/snapshot would happily serve (it probes the substream first) --
+  // freezing this overlay on an old low-res image. main.jpg probes the
+  // mainstream first and only falls back to the substream.
+  nextImg.src = '/api/stream/' + currentFsTarget.dvr + '/' + currentFsTarget.ch + '/main.jpg?t=' + now;
 }
 
 async function fullscreen(dvr, ch) {
@@ -1271,7 +1289,10 @@ async function fullscreen(dvr, ch) {
   video.style.display = 'none';
   img.style.display = 'block';
 
-  // 1. Instant paint fallback preview frame (<50ms)
+  // 1. Instant paint fallback preview frame (<50ms). Substream-first here is
+  // deliberate and correct: the mainstream hasn't been asked for yet, so the
+  // substream's live frame is the fastest thing that can be on screen. The
+  // poll loop above then upgrades to the mainstream as soon as it connects.
   img.src = '/api/snapshot/' + dvr + '/' + ch + '?t=' + Date.now();
 
   // 2. Tell Kiosk Wall to switch hardware TV output to 1080p mainstream immediately

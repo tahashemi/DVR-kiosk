@@ -202,6 +202,18 @@ struct stream {
     pthread_t tid;
     int running;
     int connected;             /* purely for STATUS reporting */
+    /* Decode gate. The connection stays fully established and drained while
+     * paused -- only the expensive part (decode + scale + publish) is
+     * skipped. This exists because tearing a stream *down* and bringing it
+     * back is enormously more expensive than just not decoding it: every
+     * restart is an RTSP handshake plus avformat_find_stream_info() plus a
+     * keyframe wait, and it also makes go2rtc drop and re-establish its
+     * DVRIP connection to the DVR. Doing that to 16 substreams at once (as
+     * a roster swap on every fullscreen toggle did) pinned all four cores
+     * and drove load past 30. Pausing costs only the packet read, so
+     * fullscreen can keep the grid connected-but-idle and resume it
+     * instantly on exit. */
+    volatile int paused;
 };
 
 static struct stream STREAMS[MAX_STREAMS];
@@ -236,6 +248,56 @@ static int TARGET_FPS = DEFAULT_FPS;
 static volatile int MJPEG_FPS_THUMB = 2;
 static volatile int MJPEG_FPS_MAIN = 2;
 
+/* Concurrency gate for the stream-open phase only.
+ *
+ * Opening a stream is by far the most expensive thing a decode thread ever
+ * does -- RTSP handshake, avformat_find_stream_info() (which parses and
+ * decodes packets to work out stream parameters), avcodec_open2(), and a
+ * wait for the first keyframe -- and it also makes go2rtc establish a fresh
+ * DVRIP connection upstream to the DVR. Steady-state decoding is cheap by
+ * comparison. roster_set() starts every new stream at once, so any event
+ * that brings up many streams together (process startup, or a whole DVR
+ * coming back and its 8 channels retrying in lockstep via stream_thread()'s
+ * backoff) used to run all of those open phases simultaneously and peg all
+ * four cores. Letting only a few open at a time turns that burst into a
+ * short ramp; total time to a full wall barely changes because the work is
+ * largely serialised by the CPU anyway, but the machine stays responsive. */
+#define MAX_CONCURRENT_OPENS 4
+static pthread_mutex_t OPEN_GATE_LOCK = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t OPEN_GATE_COND = PTHREAD_COND_INITIALIZER;
+static int OPEN_GATE_SLOTS = MAX_CONCURRENT_OPENS;
+
+/* Returns 1 if a slot was acquired, 0 if the wait was cancelled because the
+ * process is shutting down or this stream is being torn down. Waits with a
+ * timeout rather than indefinitely so neither of those cases has to
+ * broadcast on the condvar to guarantee this thread makes progress -- a
+ * plain pthread_cond_wait() here would hang roster_set()'s pthread_join()
+ * behind a stream that is queued for a slot it will never be given. */
+static int open_gate_acquire(struct stream *s) {
+    pthread_mutex_lock(&OPEN_GATE_LOCK);
+    while (OPEN_GATE_SLOTS <= 0) {
+        if (!RUN || !s->running) {
+            pthread_mutex_unlock(&OPEN_GATE_LOCK);
+            return 0;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 200000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
+        pthread_cond_timedwait(&OPEN_GATE_COND, &OPEN_GATE_LOCK, &ts);
+    }
+    OPEN_GATE_SLOTS--;
+    pthread_mutex_unlock(&OPEN_GATE_LOCK);
+    return 1;
+}
+
+static void open_gate_release(void) {
+    pthread_mutex_lock(&OPEN_GATE_LOCK);
+    OPEN_GATE_SLOTS++;
+    pthread_cond_signal(&OPEN_GATE_COND);
+    pthread_mutex_unlock(&OPEN_GATE_LOCK);
+}
+
 /* One decode session. Returns when the stream dies so the caller can retry. */
 static void stream_session(struct stream *s) {
     AVFormatContext *fmt = NULL;
@@ -244,6 +306,7 @@ static void stream_session(struct stream *s) {
     AVFrame *frame = NULL;
     AVPacket *pkt = NULL;
     int vstream = -1;
+    int gate_held = 0;
 
     int is_main = s->slot_w > THUMB_W;
 
@@ -257,6 +320,12 @@ static void stream_session(struct stream *s) {
     av_dict_set(&opts, "probesize", is_main ? "262144" : "32768", 0);
     av_dict_set(&opts, "stimeout", "10000000", 0);   /* 10s socket timeout */
     av_dict_set(&opts, "max_delay", "0", 0);
+
+    /* Everything from here to avcodec_open2() is the expensive open phase --
+     * see the open gate's comment above. Released as soon as the decoder is
+     * up so the steady-state decode loop never holds a slot. */
+    if (!open_gate_acquire(s)) goto done;
+    gate_held = 1;
 
     if (avformat_open_input(&fmt, s->url, NULL, &opts) < 0) goto done;
     if (avformat_find_stream_info(fmt, NULL) < 0) goto done;
@@ -290,6 +359,9 @@ static void stream_session(struct stream *s) {
     dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
     if (avcodec_open2(dec, codec, NULL) < 0) goto done;
 
+    open_gate_release();
+    gate_held = 0;
+
     frame = av_frame_alloc();
     pkt = av_packet_alloc();
     if (!frame || !pkt) goto done;
@@ -300,10 +372,28 @@ static void stream_session(struct stream *s) {
     s->connected = 1;
     logmsg("stream[%s]: connected", s->name);
 
+    int was_paused = 0;
     while (RUN && s->running) {
         int r = av_read_frame(fmt, pkt);
         if (r < 0) break;
         if (pkt->stream_index != vstream) { av_packet_unref(pkt); continue; }
+
+        /* Paused: drain the socket but skip decode/scale/publish entirely.
+         * Reading and discarding is what keeps the RTSP session (and
+         * go2rtc's upstream DVRIP connection) alive and its buffers from
+         * backing up, so resuming needs no handshake -- just the next
+         * keyframe. On resume, flush the decoder: the packets dropped
+         * while paused leave it without valid reference frames, so feeding
+         * it mid-GOP P-frames would decode garbage until the next IDR. */
+        if (s->paused) {
+            av_packet_unref(pkt);
+            was_paused = 1;
+            continue;
+        }
+        if (was_paused) {
+            was_paused = 0;
+            avcodec_flush_buffers(dec);
+        }
 
         r = avcodec_send_packet(dec, pkt);
         av_packet_unref(pkt);
@@ -362,6 +452,10 @@ static void stream_session(struct stream *s) {
     }
 
 done:
+    /* Every failure path above jumps here, so this is the one place the open
+     * gate can be safely released -- missing it would permanently leak a
+     * slot and eventually deadlock all reconnects. */
+    if (gate_held) open_gate_release();
     s->connected = 0;
     if (sws) sws_freeContext(sws);
     if (pkt) av_packet_free(&pkt);
@@ -543,6 +637,41 @@ static void roster_set(char urls[][URL_MAX], int n) {
 
 /* ---------------------------------------------------------------- layout */
 
+/* Decode exactly these n roster streams; pause every other one. Pausing keeps
+ * the connection up and only skips decode+scale+publish (see struct stream's
+ * `paused` comment), so this is the cheap way to say "stop spending CPU on
+ * the grid while fullscreen is up" without the teardown/reconnect storm that
+ * swapping the whole roster caused. An empty list resumes everything, so a
+ * caller that never issues DECODE gets the old always-decode behaviour. */
+static void decode_set(char urls[][URL_MAX], int n) {
+    if (n > MAX_STREAMS) n = MAX_STREAMS;
+    pthread_mutex_lock(&ROSTER_LOCK);
+    if (n == 0) {
+        for (int i = 0; i < MAX_STREAMS; i++)
+            if (STREAMS[i].used) STREAMS[i].paused = 0;
+        pthread_mutex_unlock(&ROSTER_LOCK);
+        logmsg("decode: all streams resumed");
+        return;
+    }
+    int wanted[MAX_STREAMS];
+    memset(wanted, 0, sizeof wanted);
+    for (int i = 0; i < n; i++) {
+        char name[NAME_MAX_LEN];
+        url_basename(urls[i], name, sizeof name);
+        int idx = roster_find_locked(name);
+        if (idx < 0) { logmsg("decode: %s not in roster, skipped", name); continue; }
+        wanted[idx] = 1;
+    }
+    int active = 0, paused = 0;
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        if (!STREAMS[i].used) continue;
+        STREAMS[i].paused = !wanted[i];
+        if (wanted[i]) active++; else paused++;
+    }
+    pthread_mutex_unlock(&ROSTER_LOCK);
+    logmsg("decode: %d decoding, %d paused", active, paused);
+}
+
 /* Point the composite at n already-decoding roster streams, arranged in a
  * grid; cols = ceil(sqrt(n)) so any channel count from the dashboard's
  * drag-and-drop works, not just 16. Streams not found in the roster (should
@@ -674,6 +803,15 @@ static void handle_cmd(int fd, char *line) {
         roster_set(urls, n);
         dprintf(fd, "OK %d\n", n);
 
+    } else if (strcmp(cmd, "DECODE") == 0) {
+        static char urls[MAX_STREAMS][URL_MAX];
+        int n = 0;
+        char *tok;
+        while ((tok = strtok(NULL, " \t\r\n")) && n < MAX_STREAMS)
+            snprintf(urls[n++], URL_MAX, "%s", tok);
+        decode_set(urls, n);
+        dprintf(fd, "OK %d\n", n);
+
     } else if (strcmp(cmd, "LAYOUT") == 0) {
         static char urls[MAX_STREAMS][URL_MAX];
         int n = 0;
@@ -753,9 +891,10 @@ static void handle_cmd(int fd, char *line) {
             pthread_mutex_unlock(&s->lock);
             dprintf(fd,
                     "%s{\"url\":\"%s\",\"name\":\"%s\",\"connected\":%d,"
-                    "\"have_frame\":%d,\"age_ms\":%lld,\"frames\":%lld}",
-                    first ? "" : ",", s->url, s->name, s->connected ? 1 : 0, hf,
-                    (long long)age, (long long)frames);
+                    "\"paused\":%d,\"have_frame\":%d,\"age_ms\":%lld,"
+                    "\"frames\":%lld}",
+                    first ? "" : ",", s->url, s->name, s->connected ? 1 : 0,
+                    s->paused ? 1 : 0, hf, (long long)age, (long long)frames);
             first = 0;
         }
         dprintf(fd, "]}\n");
@@ -922,12 +1061,19 @@ static void *thumb_encoder_thread(void *arg) {
 
             pthread_mutex_lock(&s->lock);
             int have = s->have_frame;
+            int paused_now = s->paused;
             int64_t requested = s->requested_ms;
             int64_t last_jpeg = s->jpeg_ms;
             int sw = s->slot_w, sh = s->slot_h;
+            int has_jpeg = s->jpeg != NULL;
             if (have && s->slot) memcpy(scratch, s->slot, (size_t)sw * sh * 4);
             pthread_mutex_unlock(&s->lock);
             if (!have) continue;
+            /* A paused stream's frame is frozen by definition, so re-encoding
+             * it produces byte-identical JPEGs forever. Encode once (so a
+             * viewer that opens it still gets something) and then leave it
+             * alone until it resumes. */
+            if (paused_now && has_jpeg) continue;
             /* Nobody's asked for this channel recently -- decoding stays on
              * (cheap, and needed for the TV grid regardless), but skip the
              * JPEG encode. This is what keeps an idle dashboard from paying
