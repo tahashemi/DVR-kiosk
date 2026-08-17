@@ -80,6 +80,14 @@ def set_fps(target_fps):
     return _send(f"FPS {max(1, min(30, int(target_fps)))}")
 
 
+def set_jpeg_fps(thumb_fps, main_fps):
+    """Set the WebUI-preview JPEG re-encode rate (grid/pool thumbnails and
+    the fullscreen live-preview cache). Independent of set_fps()/TARGET_FPS
+    -- the TV output never touches JPEG, so this only trades WebUI preview
+    freshness for CPU, which is what cpu_load_governor() uses it for."""
+    return _send(f"JPEGFPS {max(1, min(30, int(thumb_fps)))} {max(1, min(30, int(main_fps)))}")
+
+
 def clear():
     """Blank the TV output only. The roster keeps decoding, so the dashboard's
     channel pool keeps showing live thumbnails -- this is a display

@@ -65,8 +65,6 @@
 #define THUMB_W 320
 #define THUMB_H 180
 #define HTTP_PORT 8590
-#define MJPEG_FPS_THUMB 2   /* grid/pool thumbnails -- 320x180, cheap to re-encode */
-#define MJPEG_FPS_MAIN 2    /* fullscreen HD WebUI preview -- capped to 2fps to eliminate CPU spikes */
 #define DEMAND_WINDOW_MS 3000   /* stop encoding a channel this long after its last request */
 
 /* ---------------------------------------------------------------- logging */
@@ -228,6 +226,15 @@ static volatile int RUN = 1;
 static volatile int BLANKED = 0;
 static volatile int FB_DIRTY = 1;   /* clear the fb on next composite pass */
 static int TARGET_FPS = DEFAULT_FPS;
+/* JPEG re-encode rate for the WebUI preview path only (grid/pool thumbnails
+ * and the fullscreen live-preview cache) -- the TV output never touches
+ * JPEG at all, it blits decoded BGRA straight to /dev/fb0, so these two
+ * only affect how fresh a browser tab's picture is, not what's on the
+ * screen. Runtime-adjustable (see "JPEGFPS" in handle_cmd()) so
+ * cpu_load_governor() in dvr_control.py can trade WebUI preview freshness
+ * for CPU headroom under load without touching the actual display. */
+static volatile int MJPEG_FPS_THUMB = 2;
+static volatile int MJPEG_FPS_MAIN = 2;
 
 /* One decode session. Returns when the stream dies so the caller can retry. */
 static void stream_session(struct stream *s) {
@@ -720,10 +727,20 @@ static void handle_cmd(int fd, char *line) {
         if (v) TARGET_FPS = atoi(v);
         dprintf(fd, "OK %d\n", TARGET_FPS);
 
+    } else if (strcmp(cmd, "JPEGFPS") == 0) {
+        /* Runtime WebUI-preview JPEG rate, independent of TARGET_FPS/the TV
+         * compositor -- see MJPEG_FPS_THUMB/_MAIN's declaration comment. */
+        char *thumb_s = strtok(NULL, " \t\r\n");
+        char *main_s = strtok(NULL, " \t\r\n");
+        if (thumb_s) { int v = atoi(thumb_s); if (v > 0) MJPEG_FPS_THUMB = v; }
+        if (main_s) { int v = atoi(main_s); if (v > 0) MJPEG_FPS_MAIN = v; }
+        dprintf(fd, "OK %d %d\n", MJPEG_FPS_THUMB, MJPEG_FPS_MAIN);
+
     } else if (strcmp(cmd, "STATUS") == 0) {
         int64_t t = now_ms();
         pthread_mutex_lock(&ROSTER_LOCK);
-        dprintf(fd, "{\"blanked\":%d,\"fps\":%d,\"streams\":[", BLANKED ? 1 : 0, TARGET_FPS);
+        dprintf(fd, "{\"blanked\":%d,\"fps\":%d,\"jpeg_fps_thumb\":%d,\"jpeg_fps_main\":%d,\"streams\":[",
+                BLANKED ? 1 : 0, TARGET_FPS, MJPEG_FPS_THUMB, MJPEG_FPS_MAIN);
         int first = 1;
         for (int i = 0; i < MAX_STREAMS; i++) {
             struct stream *s = &STREAMS[i];

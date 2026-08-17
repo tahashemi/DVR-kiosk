@@ -10,7 +10,6 @@ import urllib.request
 
 from flask import Flask, jsonify, render_template_string, request, Response, make_response
 import waitress
-from waitress.server import create_server
 
 import dvr_config
 import channel_labels
@@ -381,42 +380,74 @@ def sync_power_schedule():
         time.sleep(10)
 
 
-def get_normalized_cpu_load_pct():
-    """Universal normalized CPU utilization across any OS and core count."""
+def _read_cpu_ticks():
+    with open("/proc/stat") as f:
+        vals = [int(x) for x in f.readline().split()[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)   # idle + iowait
+    return sum(vals), idle
+
+
+def get_recent_cpu_load_pct(sample_sec=3.0):
+    """CPU utilization over the last `sample_sec` seconds, from /proc/stat
+    deltas. os.getloadavg()[0] is a 1-minute exponentially smoothed average
+    -- at an 8s control interval that reacts late to a spike and stays
+    elevated well after it passes, so a throttle built on it either lags
+    real conditions or overcorrects. This tracks what's actually happening
+    right now instead."""
     try:
-        load1, _, _ = os.getloadavg()
-        cores = os.cpu_count() or 1
-        return (load1 / cores) * 100.0
+        t0, i0 = _read_cpu_ticks()
+        time.sleep(sample_sec)
+        t1, i1 = _read_cpu_ticks()
+        dt, di = t1 - t0, i1 - i0
+        if dt <= 0:
+            return 0.0
+        return max(0.0, min(100.0, (1.0 - di / dt) * 100.0))
     except Exception:
         return 0.0
 
 
 def cpu_load_governor():
-    """Dynamically scales TV compositor and WebUI polling FPS using a multi-tier ladder."""
-    current_target_fps = 15
+    """Trades WebUI-preview JPEG freshness for CPU headroom under load.
+
+    Drives dvrwall's MJPEG_FPS_THUMB/_MAIN (see wall.set_jpeg_fps()), not
+    the TV compositor's TARGET_FPS -- the compositor runs on a fixed
+    COMPOSITOR_HZ tick with event-driven blit-on-new-frame (dvrwall.c), so
+    TARGET_FPS no longer paces anything there and throttling it would do
+    nothing to actual CPU use. JPEG re-encoding (grid/pool thumbnails and
+    the fullscreen live-preview cache) is the genuinely CPU-costly, load-
+    sensitive path, and it only affects a browser tab's picture, never the
+    physical TV output -- so it's the right thing to degrade first. The
+    mainstream (fullscreen) re-encode is larger and pricier per frame than
+    a thumbnail, so its tier drops before the thumbnail tier does.
+
+    Sends JPEGFPS every cycle regardless of whether the computed tier
+    changed from last time, rather than tracking "current" locally and
+    only sending on a delta -- dvrwall's actual state can drift out from
+    under a locally-tracked belief (a dvrwall restart resets to its
+    compiled-in default, or something else touches the same control
+    socket), and a stale belief means the governor silently stops
+    correcting it. JPEGFPS is a trivial O(1) command on dvrwall's side (two
+    int writes, no stream teardown), so there's no real cost to just always
+    asserting the computed tier.
+    """
     while True:
         try:
-            load_pct = get_normalized_cpu_load_pct()
-            # Multi-tier progressive throttle ladder:
-            if load_pct > 92.0:
-                new_fps = 2    # Tier 5: Emergency survival mode
-            elif load_pct > 88.0:
-                new_fps = 5    # Tier 4: Heavy load
+            load_pct = get_recent_cpu_load_pct()
+            if load_pct > 90.0:
+                main_fps, thumb_fps = 1, 1     # Tier 5: emergency
             elif load_pct > 80.0:
-                new_fps = 8    # Tier 3: High load
+                main_fps, thumb_fps = 1, 2     # Tier 4: heavy load
             elif load_pct > 70.0:
-                new_fps = 12   # Tier 2: Moderate load
-            elif load_pct < 60.0:
-                new_fps = 20   # Tier 1: Maximum performance
+                main_fps, thumb_fps = 2, 2     # Tier 3: high load
+            elif load_pct > 55.0:
+                main_fps, thumb_fps = 3, 3     # Tier 2: moderate load
             else:
-                new_fps = current_target_fps
+                main_fps, thumb_fps = 6, 3     # Tier 1: normal
 
-            if new_fps != current_target_fps:
-                current_target_fps = new_fps
-                wall.set_fps(current_target_fps)
+            wall.set_jpeg_fps(thumb_fps, main_fps)
         except Exception:
             pass
-        time.sleep(8)
+        time.sleep(5)   # plus the ~3s spent sampling above, ~8s per cycle
 
 
 def start_background_workers():
