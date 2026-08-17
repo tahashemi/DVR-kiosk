@@ -381,9 +381,48 @@ def sync_power_schedule():
         time.sleep(10)
 
 
+def get_normalized_cpu_load_pct():
+    """Universal normalized CPU utilization across any OS and core count."""
+    try:
+        load1, _, _ = os.getloadavg()
+        cores = os.cpu_count() or 1
+        return (load1 / cores) * 100.0
+    except Exception:
+        return 0.0
+
+
+def cpu_load_governor():
+    """Dynamically scales TV compositor and WebUI polling FPS using a multi-tier ladder."""
+    current_target_fps = 15
+    while True:
+        try:
+            load_pct = get_normalized_cpu_load_pct()
+            # Multi-tier progressive throttle ladder:
+            if load_pct > 92.0:
+                new_fps = 2    # Tier 5: Emergency survival mode
+            elif load_pct > 88.0:
+                new_fps = 5    # Tier 4: Heavy load
+            elif load_pct > 80.0:
+                new_fps = 8    # Tier 3: High load
+            elif load_pct > 70.0:
+                new_fps = 12   # Tier 2: Moderate load
+            elif load_pct < 60.0:
+                new_fps = 20   # Tier 1: Maximum performance
+            else:
+                new_fps = current_target_fps
+
+            if new_fps != current_target_fps:
+                current_target_fps = new_fps
+                wall.set_fps(current_target_fps)
+        except Exception:
+            pass
+        time.sleep(8)
+
+
 def start_background_workers():
     threading.Thread(target=grid_watchdog, daemon=True).start()
     threading.Thread(target=sync_power_schedule, daemon=True).start()
+    threading.Thread(target=cpu_load_governor, daemon=True).start()
 
 
 
@@ -852,16 +891,22 @@ let poolSortables = [];
 function tileKey(c) { return c.dvr + ':' + c.ch; }
 
 function getTileStatus(dvr, ch) {
-  const key = dvr + '/' + ch;
-  const info = (healthCache && healthCache.streams) ? healthCache.streams[key] : null;
-  if (!info) return { cls: 'offline', title: 'Offline / Unreachable' };
-  if (info.connected && info.have_frame) return { cls: 'online', title: 'Live ' + info.age_ms + 'ms' };
-  if (info.connected) return { cls: 'stale', title: 'Connecting / Stale' };
-  return { cls: 'offline', title: 'Stream Disconnected' };
+  const dvrInfo = (healthCache && healthCache.dvrs) ? healthCache.dvrs[dvr] : null;
+  const streamInfo = (healthCache && healthCache.streams) ? healthCache.streams[dvr + '/' + ch] : null;
+
+  const isReachable = dvrInfo ? dvrInfo.reachable : true;
+  const isDecoding = streamInfo && streamInfo.connected && streamInfo.have_frame;
+
+  if (!isReachable) {
+    return { cls: 'offline', title: 'DVR Unreachable / Offline', online: false };
+  }
+  if (isDecoding) {
+    return { cls: 'online', title: 'Live on TV (' + streamInfo.age_ms + 'ms)', online: true, liveTv: true };
+  }
+  return { cls: 'online', title: 'Ready (On-Demand)', online: true, liveTv: false };
 }
 
-function tileEl(c, inProfile, opts) {
-  const live = !!(opts && opts.live);
+function tileEl(c, inProfile) {
   const div = document.createElement('div');
   const isFs = fullscreenTarget && fullscreenTarget.dvr === c.dvr && fullscreenTarget.ch === c.ch;
   div.className = 'tile' + (inProfile ? ' in-profile' : '') + (isFs ? ' is-fullscreen' : '');
@@ -876,18 +921,9 @@ function tileEl(c, inProfile, opts) {
   const img = document.createElement('img');
   img.loading = 'lazy';
   img.className = 'live-thumb';
-  // The kiosk-grid mirror (bounded to whatever's on the TV, <=16 tiles) gets
-  // a real persistent MJPEG stream via dvrwall, same as WebUI fullscreen --
-  // small, safely-bounded connection count. The channel pool (up to ~44
-  // tiles) stays on one-shot snapshots to avoid opening that many
-  // long-lived connections against the dashboard's worker-thread pool; its
-  // thumbnails are instead refreshed periodically in place (see
-  // refreshPoolThumbs()) without touching the DOM or Sortable state.
-  img.src = live
-    ? '/api/live/' + c.dvr + '/' + c.ch + '?t=' + Date.now()
-    : '/api/snapshot/' + c.dvr + '/' + c.ch + '?t=' + Date.now();
+  img.src = '/api/snapshot/' + c.dvr + '/' + c.ch + '?t=' + Date.now();
   img.onload = () => { img.style.display = ''; offline.style.display = 'none'; };
-  img.onerror = () => { img.style.display = 'none'; offline.style.display = 'block'; };
+  img.onerror = () => { offline.style.display = 'block'; };
 
   const offline = document.createElement('div');
   offline.className = 'offline';
@@ -959,16 +995,8 @@ function renderPool(force = true) {
   if (isWebFullscreenActive) return; // Background render suspended during fullscreen
   const pool = document.getElementById('pool');
   if (!pool) return;
-  // Rebuilding the pool tears down and recreates every tile plus every
-  // per-DVR Sortable instance -- unconditionally doing that on every
-  // refreshStatus() tick (every 5s) serves no purpose when nothing that
-  // actually changes the layout has changed, and needlessly churns
-  // drag-and-drop state. Skip when the effective input set is identical;
-  // every other caller (drag-and-drop, filter/search, edit mode, profile
-  // switch) still passes the default force=true and always redraws. Pool
-  // thumbnails themselves keep refreshing independently of this -- see
-  // refreshPoolThumbs() -- so skipping a rebuild here doesn't freeze them.
-  const sig = CHANNELS.map(c => tileKey(c) + ':' + getTileStatus(c.dvr, c.ch).cls).join(',') + '|' +
+
+  const sig = CHANNELS.map(c => tileKey(c) + ':' + (getTileStatus(c.dvr, c.ch).online ? '1' : '0')).join(',') + '|' +
               kioskChannels.map(tileKey).slice().sort().join(',') + '|' +
               currentPoolFilter + '|' + currentPoolSearch;
   if (!force && sig === lastPoolRenderSig) return;
@@ -993,11 +1021,11 @@ function renderPool(force = true) {
 
       for (const c of byDvr[dvr]) {
         const st = getTileStatus(c.dvr, c.ch);
-        if (st.cls === 'online') onlineCount++;
+        if (st.online) onlineCount++;
         
         const inProfile = inProfileKeys.has(tileKey(c));
         
-        if (currentPoolFilter === 'online' && st.cls !== 'online') continue;
+        if (currentPoolFilter === 'online' && !st.online) continue;
         if (currentPoolFilter === 'ingrid' && !inProfile) continue;
         if (currentPoolSearch) {
           const q = currentPoolSearch.toLowerCase();
@@ -1055,12 +1083,7 @@ function renderKioskGrid(force = true) {
   if (isWebFullscreenActive) return; // Background render suspended during fullscreen
   const el = document.getElementById('kioskGrid');
   if (!el) return;
-  // Kiosk-grid tiles hold a persistent MJPEG connection each (see tileEl's
-  // live mode) -- an unconditional rebuild here would drop and reopen every
-  // one of them on every refreshStatus() tick for no reason. Skip when
-  // nothing that actually changes the tile set has changed; every other
-  // caller (drag-and-drop, profile switch, power on/off) still passes the
-  // default force=true and always redraws.
+
   const sig = kioskChannels.map(tileKey).join(',') + '|' +
               (fullscreenTarget ? tileKey(fullscreenTarget) : '');
   if (!force && sig === lastKioskGridSig) return;
@@ -1069,7 +1092,7 @@ function renderKioskGrid(force = true) {
   el.innerHTML = '';
   for (const c of kioskChannels) {
     const full = CHANNELS.find(x => x.dvr === c.dvr && x.ch === c.ch) || c;
-    el.appendChild(tileEl(full, true, {live: true}));
+    el.appendChild(tileEl(full, true));
   }
   refreshKioskSortable();
 }
@@ -1195,31 +1218,39 @@ async function fullscreen(dvr, ch) {
   video.style.display = 'none';
   img.style.display = 'block';
 
-  // 1. Tell Kiosk Wall to switch hardware TV output to 1080p mainstream immediately
+  // 1. Instant paint fallback preview frame (<50ms)
+  const fallbackSrc = () => '/api/snapshot/' + dvr + '/' + ch + '?t=' + Date.now();
+  const liveSrc = () => '/api/live/' + dvr + '/' + ch + '?main=1&t=' + Date.now();
+  
+  img.src = fallbackSrc();
+
+  // 2. Tell Kiosk Wall to switch hardware TV output to 1080p mainstream immediately
   fetch('/api/kiosk/fullscreen', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
+    method: 'POST', 
+    headers: {'Content-Type':'application/json'},
     body: JSON.stringify({dvr, ch})
   }).then(() => setStatus('Kiosk showing ' + label + ' (HD Mainstream)')).catch(() => {});
 
-  // 2. Live HD MJPEG stream, straight from dvrwall: a single persistent
-  // multipart/x-mixed-replace connection that the browser keeps open and
-  // repaints on its own -- no JS polling loop, no re-fetch per frame. This
-  // replaces the old 1000ms JPEG-polling loop, which existed to work
-  // around a decode backlog that dvrwall's own compositor/scheduling fixes
-  // have since eliminated (see dvrwall.c's event-driven compositor and
-  // mainstream load-shedding). If the connection drops, retry after a
-  // short delay rather than leaving a frozen frame on screen.
+  // 3. Connect to live HD MJPEG stream with retry
   clearTimeout(fsReconnectTimer);
-  const connectFsStream = () => {
+  let liveAttempting = false;
+
+  const tryConnectLive = () => {
     if (!isWebFullscreenActive) return;
-    img.src = '/api/live/' + dvr + '/' + ch + '?main=1&t=' + Date.now();
+    liveAttempting = true;
+    img.src = liveSrc();
   };
+
   img.onerror = () => {
-    if (!isWebFullscreenActive) return;
+    if (!isWebFullscreenActive || !liveAttempting) return;
+    liveAttempting = false;
+    img.src = fallbackSrc();
     clearTimeout(fsReconnectTimer);
-    fsReconnectTimer = setTimeout(connectFsStream, 2000);
+    fsReconnectTimer = setTimeout(tryConnectLive, 1500);
   };
-  connectFsStream();
+
+  // Brief delay to allow RTSP handshake before connecting live stream
+  fsReconnectTimer = setTimeout(tryConnectLive, 600);
 
   await refreshStatus();
 }
@@ -1241,6 +1272,7 @@ async function closeWebFullscreen() {
     setStatus('Returned to grid');
   } catch(e) {}
   await refreshStatus();
+  refreshAllThumbs();
 }
 
 document.getElementById('btnCloseWebFs').addEventListener('click', closeWebFullscreen);
@@ -1310,22 +1342,16 @@ async function refreshStatus() {
   }
 }
 
-let poolThumbTimer = null;
+let allThumbsTimer = null;
 
-function refreshPoolThumbs() {
-  // Bumps each existing pool tile's snapshot timestamp in place -- no DOM
-  // rebuild, no Sortable churn, no new persistent connections opened. This
-  // is what actually keeps pool thumbnails current now that renderPool()
-  // no longer rebuilds unconditionally every 5s; it also runs independently
-  // of whether renderPool() itself skipped or redrew this tick. 1s matches
-  // dvrwall's MJPEG_FPS_THUMB-backed shared JPEG cache -- polling faster
-  // than the cache actually refreshes would just re-fetch identical bytes.
+function refreshAllThumbs() {
   if (isWebFullscreenActive) return;
-  const imgs = document.querySelectorAll('#pool img.live-thumb');
+  const now = Date.now();
+  const imgs = document.querySelectorAll('#kioskGrid img.live-thumb, #pool img.live-thumb');
   for (const img of imgs) {
     const tile = img.closest('.tile');
-    if (!tile) continue;
-    img.src = '/api/snapshot/' + tile.dataset.dvr + '/' + tile.dataset.ch + '?t=' + Date.now();
+    if (!tile || !tile.dataset.dvr || !tile.dataset.ch) continue;
+    img.src = '/api/snapshot/' + tile.dataset.dvr + '/' + tile.dataset.ch + '?t=' + now;
   }
 }
 
@@ -1607,13 +1633,9 @@ async function init() {
     await refreshStatus();
   } catch(e) {}
 
-  // Status/layout poll -- infrequent, since renderPool()/renderKioskGrid()
-  // now only redraw when something actually changed (see their force param).
   setInterval(refreshStatus, 5000);
-  // Pool thumbnail refresh -- decoupled from the above so live thumbnails
-  // don't depend on a layout change happening; see refreshPoolThumbs().
-  clearInterval(poolThumbTimer);
-  poolThumbTimer = setInterval(refreshPoolThumbs, 1000);
+  clearInterval(allThumbsTimer);
+  allThumbsTimer = setInterval(refreshAllThumbs, 1500);
 }
 
 document.getElementById('profileSelect').addEventListener('change', async (e) => {
@@ -1902,28 +1924,41 @@ def api_snapshot(dvr_key, ch):
         if cached and (now - cached[1] < SNAPSHOT_TTL_SEC):
             return Response(cached[0], mimetype="image/jpeg")
 
-    name = dvr_config.stream_name(dvr_key, ch)
-    # 1. Fast path: dvrwall shared memory JPEG cache (for channels in kiosk grid)
-    try:
-        req = urllib.request.Request(f"http://127.0.0.1:{WALL_HTTP_PORT}/jpeg/{name}")
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
-            data = resp.read()
-        with _CACHE_LOCK:
-            _SNAPSHOT_CACHE[key] = (data, now)
-        return Response(data, mimetype="image/jpeg")
-    except Exception:
-        pass
+    name = dvr_config.stream_name(dvr_key, ch, mainstream=False)
+    main_name = dvr_config.stream_name(dvr_key, ch, mainstream=True)
+
+    # 1. Fast path: dvrwall shared memory JPEG cache (substream or active mainstream)
+    for candidate in (name, main_name):
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{WALL_HTTP_PORT}/jpeg/{candidate}")
+            with urllib.request.urlopen(req, timeout=1.2) as resp:
+                data = resp.read()
+            if data and len(data) > 100:
+                with _CACHE_LOCK:
+                    _SNAPSHOT_CACHE[key] = (data, now)
+                return Response(data, mimetype="image/jpeg")
+        except Exception:
+            pass
 
     # 2. Fallback: go2rtc frame API (for pool channels not currently in kiosk grid)
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{GO2RTC_HTTP_PORT}/api/frame.jpeg?src={name}")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = resp.read()
-        with _CACHE_LOCK:
-            _SNAPSHOT_CACHE[key] = (data, now)
-        return Response(data, mimetype="image/jpeg")
-    except Exception as e:
-        return str(e), 502
+        if data and len(data) > 100:
+            with _CACHE_LOCK:
+                _SNAPSHOT_CACHE[key] = (data, now)
+            return Response(data, mimetype="image/jpeg")
+    except Exception:
+        pass
+
+    # 3. Last resort fallback: return last known cached snapshot even if slightly older than TTL
+    with _CACHE_LOCK:
+        cached = _SNAPSHOT_CACHE.get(key)
+        if cached and cached[0]:
+            return Response(cached[0], mimetype="image/jpeg")
+
+    return "stream not ready", 503
 
 
 @app.route('/api/stream/<dvr_key>/<int:ch>/main.mp4')
@@ -2131,7 +2166,9 @@ def api_kiosk_grid():
 @require_auth
 def api_kiosk_fullscreen():
     body = request.get_json(force=True)
-    launch_fullscreen(body["dvr"], int(body["ch"]))
+    dvr = body.get("dvr")
+    ch = int(body.get("ch", 1))
+    threading.Thread(target=launch_fullscreen, args=(dvr, ch), daemon=True).start()
     return jsonify({"ok": True})
 
 

@@ -75,6 +75,11 @@ def set_fullscreen(dvr_key, ch, mainstream=True):
     return _send("FULLSCREEN " + stream_url(dvr_key, ch, mainstream=mainstream))
 
 
+def set_fps(target_fps):
+    """Dynamically set the compositor target framerate in dvrwall."""
+    return _send(f"FPS {max(1, min(30, int(target_fps)))}")
+
+
 def clear():
     """Blank the TV output only. The roster keeps decoding, so the dashboard's
     channel pool keeps showing live thumbnails -- this is a display
