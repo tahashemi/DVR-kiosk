@@ -2229,74 +2229,14 @@ def api_schedule_put():
     return jsonify({"ok": True})
 
 
-CERT_CANDIDATES = [
-    ("/etc/dvr-kiosk/certs/dvr-kiosk.pem", "/etc/dvr-kiosk/certs/dvr-kiosk-key.pem"),
-    ("/root/certs/dvr-kiosk.pem", "/root/certs/dvr-kiosk-key.pem"),
-    (os.path.join(os.path.dirname(os.path.abspath(__file__)), "../certs/dvr-kiosk.pem"),
-     os.path.join(os.path.dirname(os.path.abspath(__file__)), "../certs/dvr-kiosk-key.pem")),
-    ("certs/dvr-kiosk.pem", "certs/dvr-kiosk-key.pem"),
-]
-
-
-def find_ssl_certs():
-    for cert_path, key_path in CERT_CANDIDATES:
-        if os.path.exists(cert_path) and os.path.exists(key_path):
-            return cert_path, key_path
-    return None, None
-
-
-def run_http_redirect():
-    """Plain-HTTP server on :80 that bounces to HTTPS or serves if behind reverse proxy."""
-    redirect_app = Flask(__name__ + "_redirect")
-
-    @redirect_app.route('/', defaults={'path': ''})
-    @redirect_app.route('/<path:path>')
-    def redirect_to_https(path):
-        from flask import redirect
-        # If pfSense HAProxy forwards HTTP on port 80 with X-Forwarded-Proto
-        if request.headers.get("X-Forwarded-Proto") == "https":
-            return app(request.environ, lambda s, h: None)
-        return redirect(f"https://{request.host.split(':')[0]}/{path}", code=301)
-
-    try:
-        waitress.serve(redirect_app, host='0.0.0.0', port=80, threads=4)
-    except Exception as e:
-        print(f"[run_http_redirect] Error binding port 80: {e}", flush=True)
-
-
 def run_server():
-    """Serve the dashboard over HTTPS (port 443) or plain HTTP fallback."""
-    cert_file, key_file = find_ssl_certs()
-    if cert_file and key_file:
-        try:
-            print(f"[*] Found SSL certs at {cert_file}, starting HTTPS server on port 443...", flush=True)
-            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_ctx.load_cert_chain(cert_file, key_file)
-
-            threading.Thread(target=run_http_redirect, daemon=True).start()
-
-            # threads=32: the kiosk-grid mirror and WebUI fullscreen now hold
-            # persistent MJPEG connections open (worst case ~16 grid tiles +
-            # 1 fullscreen), which occupy a worker thread for their whole
-            # lifetime rather than a single request/response. 8 was sized for
-            # short-lived requests only; a live grid view would have
-            # exhausted it and stalled the rest of the dashboard exactly like
-            # the compositor-hang bug this session already fixed once for a
-            # different root cause. 32 gives headroom above the bounded
-            # worst case plus normal API traffic.
-            server = create_server(app, host='0.0.0.0', port=443, threads=32)
-            server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
-            server.run()
-            return
-        except Exception as e:
-            print(f"[!] Failed to start HTTPS on port 443 ({e}), falling back to plain HTTP...", flush=True)
-
-    print("[*] SSL certs not found or port 443 unavailable, running plain HTTP on port 80...", flush=True)
+    """Serve the dashboard over plain HTTP on port 80 (TLS offloaded to pfSense / reverse proxy)."""
+    print("[*] Starting lightweight plain HTTP server on port 80 (TLS offloaded to pfSense)...", flush=True)
     try:
-        waitress.serve(app, host='0.0.0.0', port=80, threads=32)
+        waitress.serve(app, host='0.0.0.0', port=80, threads=16)
     except Exception as e:
         print(f"[!] Failed to bind port 80 ({e}), falling back to port 8080...", flush=True)
-        waitress.serve(app, host='0.0.0.0', port=8080, threads=32)
+        waitress.serve(app, host='0.0.0.0', port=8080, threads=16)
 
 
 if __name__ == '__main__':
