@@ -245,7 +245,7 @@ def set_fps(target_fps):
     return _send(f"FPS {int(target_fps)}")
 ```
 
-- [ ] **Step 2: Implement universal `cpu_load_governor()` background worker in `dvr_control.py`**
+- [ ] **Step 2: Implement universal progressive `cpu_load_governor()` background worker in `dvr_control.py`**
 
 ```python
 def get_normalized_cpu_load_pct():
@@ -258,23 +258,29 @@ def get_normalized_cpu_load_pct():
         return 0.0
 
 def cpu_load_governor():
-    """Dynamically scales TV compositor and WebUI polling FPS based on CPU load."""
+    """Dynamically scales TV compositor and WebUI polling FPS using a multi-tier ladder."""
     current_target_fps = 15
     while True:
         try:
             load_pct = get_normalized_cpu_load_pct()
-            # If normalized CPU load exceeds 80% on any CPU architecture / core count
-            if load_pct > 80.0:
-                if current_target_fps > 8:
-                    current_target_fps = 8
-                    wall.set_fps(current_target_fps)
+            # Multi-tier progressive throttle ladder:
+            if load_pct > 92.0:
+                new_fps = 2    # Tier 5: Emergency survival mode
+            elif load_pct > 88.0:
+                new_fps = 5    # Tier 4: Heavy load
+            elif load_pct > 80.0:
+                new_fps = 8    # Tier 3: High load
+            elif load_pct > 70.0:
+                new_fps = 12   # Tier 2: Moderate load
             elif load_pct < 60.0:
-                if current_target_fps < 15:
-                    current_target_fps = 15
-                    wall.set_fps(current_target_fps)
-        except Exception as e:
+                new_fps = 20   # Tier 1: Maximum performance
+
+            if new_fps != current_target_fps:
+                current_target_fps = new_fps
+                wall.set_fps(current_target_fps)
+        except Exception:
             pass
-        time.sleep(10)
+        time.sleep(8)
 ```
 
 - [ ] **Step 3: Start `cpu_load_governor()` in `start_background_workers()`**
