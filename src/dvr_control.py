@@ -150,6 +150,25 @@ _reach_lock = threading.Lock()
 REACH_TTL_OK = 30
 REACH_TTL_FAIL = 60
 
+# Channel-pool demand tracking: dvrwall decodes 24/7 whatever CHANNELS lists,
+# so an "always decode every enabled channel" roster costs one substream's
+# worth of CPU per channel regardless of whether the dashboard pool is ever
+# open to see it (measured: ~250% of 400% for a 20-channel fleet). Track the
+# last time each channel's thumbnail was actually requested so ensure_roster()
+# can decode only the on-screen grid plus recently-viewed pool channels.
+_channel_demand = {}
+_demand_lock = threading.Lock()
+CHANNEL_DEMAND_WINDOW_SEC = 90   # generous vs dvrwall's 3s JPEG-encode window
+                                 # on purpose -- reconnecting a stream costs
+                                 # several seconds, so this avoids thrashing
+                                 # connect/disconnect while someone is just
+                                 # glancing around the pool intermittently.
+
+
+def note_channel_demand(dvr_key, ch):
+    with _demand_lock:
+        _channel_demand[f"{dvr_key}:{ch}"] = time.time()
+
 
 def dvr_reachable(dvr_key):
     """Cheap TCP reachability probe, cached."""
@@ -181,6 +200,7 @@ def dvr_reachable(dvr_key):
 def grid_watchdog():
     global wall_status_cache
     wall_was_down = False
+    last_roster_refresh = 0.0
     while True:
         try:
             st = wall.status()
@@ -202,6 +222,18 @@ def grid_watchdog():
                         target=launch_fullscreen,
                         args=(fullscreen_target["dvr"], fullscreen_target["ch"]),
                     ).start()
+
+        # Periodically re-issue CHANNELS in grid mode so channels the pool
+        # has started (or stopped) demanding get connected (or dropped)
+        # without needing a full profile switch. A no-op when nothing
+        # changed (see ensure_roster()'s docstring).
+        if current_mode == "grid" and time.time() - last_roster_refresh > 15:
+            last_roster_refresh = time.time()
+            try:
+                ensure_roster()
+            except Exception as e:
+                print(f"grid_watchdog: roster refresh failed: {e}", flush=True)
+
         time.sleep(10)
 
 
@@ -211,11 +243,46 @@ def get_all_roster_channels():
 
 
 def ensure_roster():
-    """Ensure dvrwall keeps all fleet substreams (plus active mainstream if in fullscreen) decoded in RAM."""
-    all_chans = get_all_roster_channels()
+    """Keep dvrwall's decoding roster matched to what's actually needed.
+
+    Grid mode: the on-screen grid's channels, plus any pool channel whose
+    thumbnail was actually requested within CHANNEL_DEMAND_WINDOW_SEC (see
+    note_channel_demand()) -- not the whole enabled fleet. dvrwall decodes
+    24/7 whatever this sends regardless of whether anyone's looking (measured:
+    ~250% of 400% CPU for a 20-channel "always decode everything" roster), so
+    an idle pool costs nothing and only actually-viewed channels are paid
+    for. Fullscreen mode: ONLY that one channel's mainstream -- every
+    substream connection is dropped, so CPU/bandwidth actually goes down
+    while viewing fullscreen instead of adding a 21st stream on top of the
+    other 20 (which is also what made the TV keep showing the wrong stream:
+    dvrwall was juggling 21 concurrent connections instead of just switching
+    to the one that matters). Calling this with an unchanged channel list is
+    a cheap no-op (see roster_set()'s comment in dvrwall.c), so it's safe to
+    call it repeatedly to refresh demand -- see grid_watchdog()."""
     if current_mode == "fullscreen" and fullscreen_target:
-        # Keep all 20 fleet substreams running AND add the 1080p mainstream stream for the TV
-        all_chans = all_chans + [{"dvr": fullscreen_target["dvr"], "ch": fullscreen_target["ch"], "mainstream": True}]
+        all_chans = [{
+            "dvr": fullscreen_target["dvr"],
+            "ch": fullscreen_target["ch"],
+            "mainstream": True,
+        }]
+    else:
+        wanted = set()
+        for c in (active_channels_cache or []):
+            dvr_key, ch = c.get("dvr"), c.get("ch")
+            if dvr_key is not None and ch is not None:
+                wanted.add((dvr_key, ch))
+        now = time.time()
+        with _demand_lock:
+            demanded_keys = [k for k, ts in _channel_demand.items() if now - ts < CHANNEL_DEMAND_WINDOW_SEC]
+        for key in demanded_keys:
+            dvr_key, _, ch_s = key.partition(":")
+            try:
+                wanted.add((dvr_key, int(ch_s)))
+            except ValueError:
+                continue
+        enabled = set(dvr_config.all_channels(enabled_only=True))
+        wanted &= enabled   # never roster a disabled/removed channel
+        all_chans = [{"dvr": d, "ch": c, "mainstream": False} for d, c in wanted]
     if all_chans:
         try:
             wall.set_channels(all_chans)
@@ -230,13 +297,16 @@ def launch_grid():
         try:
             current_mode = "grid"
             fullscreen_target = None
-            ensure_roster()
             chans = profiles.get_active_channels()
             # Filter to enabled DVR channels only
             enabled_keys = set(k for k, v in dvr_config.get_dvrs().items() if v.get("enabled", True))
             filtered_chans = [c for c in chans if c.get("dvr") in enabled_keys]
-            wall.set_layout(filtered_chans if filtered_chans else chans)
+            # active_channels_cache must be set before ensure_roster() -- it's
+            # what tells ensure_roster() which channels are on-screen so they
+            # get rostered even if nobody has "demanded" them via the pool yet.
             active_channels_cache = list(chans)
+            ensure_roster()
+            wall.set_layout(filtered_chans if filtered_chans else chans)
             grid_ready_at = time.time()
         except wall.WallError as e:
             print(f"launch_grid: {e}", flush=True)
@@ -256,12 +326,18 @@ def launch_fullscreen(dvr, ch):
 
 
 def stream_health():
-    """Summary of go2rtc / dvrwall's view of every channel in the system."""
+    """Summary of go2rtc / dvrwall's view of every channel in the system.
+
+    Reads wall_status_cache (refreshed every ~10s by grid_watchdog's
+    background poll) instead of calling wall.status() directly. This is on
+    the hot path of /api/health and /api/kiosk/status, hit by every
+    dashboard poll from every open tab -- a synchronous call here used to
+    mean each of waitress's worker threads could independently block on the
+    compositor's control socket, which is what turned a stuck/dead
+    compositor into a fully unresponsive dashboard (see wall.py's module
+    docstring)."""
     res = {}
-    try:
-        raw = wall.status()
-    except Exception:
-        raw = None
+    raw = wall_status_cache
     if not raw or not isinstance(raw, dict):
         return res
     st_map = {}
@@ -693,7 +769,7 @@ HTML = """<!DOCTYPE html>
                 <input type="number" id="addDvrPort" placeholder="Port (3456)" class="search-input" value="3456" style="flex:1;">
                 <input type="number" id="addDvrChs" placeholder="Channels (8)" class="search-input" value="8" style="flex:1;">
               </div>
-              <input type="password" id="addDvrPass" placeholder="DVR Password (default 9198129192)" class="search-input">
+              <input type="password" id="addDvrPass" placeholder="DVR Password (leave blank for site default)" class="search-input">
               <button id="btnSubmitAddDvr" class="primary" style="width:100%;">Save DVR</button>
             </div>
           </div>
@@ -784,7 +860,8 @@ function getTileStatus(dvr, ch) {
   return { cls: 'offline', title: 'Stream Disconnected' };
 }
 
-function tileEl(c, inProfile) {
+function tileEl(c, inProfile, opts) {
+  const live = !!(opts && opts.live);
   const div = document.createElement('div');
   const isFs = fullscreenTarget && fullscreenTarget.dvr === c.dvr && fullscreenTarget.ch === c.ch;
   div.className = 'tile' + (inProfile ? ' in-profile' : '') + (isFs ? ' is-fullscreen' : '');
@@ -799,7 +876,16 @@ function tileEl(c, inProfile) {
   const img = document.createElement('img');
   img.loading = 'lazy';
   img.className = 'live-thumb';
-  img.src = '/api/snapshot/' + c.dvr + '/' + c.ch + '?t=' + Date.now();
+  // The kiosk-grid mirror (bounded to whatever's on the TV, <=16 tiles) gets
+  // a real persistent MJPEG stream via dvrwall, same as WebUI fullscreen --
+  // small, safely-bounded connection count. The channel pool (up to ~44
+  // tiles) stays on one-shot snapshots to avoid opening that many
+  // long-lived connections against the dashboard's worker-thread pool; its
+  // thumbnails are instead refreshed periodically in place (see
+  // refreshPoolThumbs()) without touching the DOM or Sortable state.
+  img.src = live
+    ? '/api/live/' + c.dvr + '/' + c.ch + '?t=' + Date.now()
+    : '/api/snapshot/' + c.dvr + '/' + c.ch + '?t=' + Date.now();
   img.onload = () => { img.style.display = ''; offline.style.display = 'none'; };
   img.onerror = () => { img.style.display = 'none'; offline.style.display = 'block'; };
 
@@ -867,10 +953,27 @@ function refreshSortableStates() {
 
 document.getElementById('btnEditMode').addEventListener('click', () => toggleEditMode());
 
-function renderPool() {
+let lastPoolRenderSig = null;
+
+function renderPool(force = true) {
   if (isWebFullscreenActive) return; // Background render suspended during fullscreen
   const pool = document.getElementById('pool');
   if (!pool) return;
+  // Rebuilding the pool tears down and recreates every tile plus every
+  // per-DVR Sortable instance -- unconditionally doing that on every
+  // refreshStatus() tick (every 5s) serves no purpose when nothing that
+  // actually changes the layout has changed, and needlessly churns
+  // drag-and-drop state. Skip when the effective input set is identical;
+  // every other caller (drag-and-drop, filter/search, edit mode, profile
+  // switch) still passes the default force=true and always redraws. Pool
+  // thumbnails themselves keep refreshing independently of this -- see
+  // refreshPoolThumbs() -- so skipping a rebuild here doesn't freeze them.
+  const sig = CHANNELS.map(c => tileKey(c) + ':' + getTileStatus(c.dvr, c.ch).cls).join(',') + '|' +
+              kioskChannels.map(tileKey).slice().sort().join(',') + '|' +
+              currentPoolFilter + '|' + currentPoolSearch;
+  if (!force && sig === lastPoolRenderSig) return;
+  lastPoolRenderSig = sig;
+
   pool.innerHTML = '';
   poolSortables = [];
   const byDvr = {};
@@ -934,6 +1037,9 @@ function renderPool() {
           preventOnFilter: false,
           delay: 0,
           touchStartThreshold: 3,
+          forceFallback: true,
+          fallbackOnBody: true,
+          fallbackTolerance: 3,
         });
         poolSortables.push(s);
       }
@@ -943,14 +1049,27 @@ function renderPool() {
   }
 }
 
-function renderKioskGrid() {
+let lastKioskGridSig = null;
+
+function renderKioskGrid(force = true) {
   if (isWebFullscreenActive) return; // Background render suspended during fullscreen
   const el = document.getElementById('kioskGrid');
   if (!el) return;
+  // Kiosk-grid tiles hold a persistent MJPEG connection each (see tileEl's
+  // live mode) -- an unconditional rebuild here would drop and reopen every
+  // one of them on every refreshStatus() tick for no reason. Skip when
+  // nothing that actually changes the tile set has changed; every other
+  // caller (drag-and-drop, profile switch, power on/off) still passes the
+  // default force=true and always redraws.
+  const sig = kioskChannels.map(tileKey).join(',') + '|' +
+              (fullscreenTarget ? tileKey(fullscreenTarget) : '');
+  if (!force && sig === lastKioskGridSig) return;
+  lastKioskGridSig = sig;
+
   el.innerHTML = '';
   for (const c of kioskChannels) {
     const full = CHANNELS.find(x => x.dvr === c.dvr && x.ch === c.ch) || c;
-    el.appendChild(tileEl(full, true));
+    el.appendChild(tileEl(full, true, {live: true}));
   }
   refreshKioskSortable();
 }
@@ -970,6 +1089,18 @@ function refreshKioskSortable() {
     preventOnFilter: false,
     delay: 0,
     touchStartThreshold: 3,
+    // Native HTML5 drag-and-drop (Sortable's default) is unreliable inside
+    // scrollable containers (both panes here are overflow-y:auto) and on
+    // some mobile browsers -- forceFallback makes Sortable simulate the
+    // drag itself via pointer events instead of relying on the browser's
+    // native DnD, which is the standard fix for "drag just doesn't start."
+    // fallbackOnBody moves the drag helper to <body> instead of leaving it
+    // inside the scrollable/overflow:hidden container, where it would
+    // otherwise get clipped/invisible -- without this, forceFallback alone
+    // makes dragging look worse than plain native DnD, not better.
+    forceFallback: true,
+    fallbackOnBody: true,
+    fallbackTolerance: 3,
     onAdd: syncKioskFromDom,
     onSort: syncKioskFromDom,
   });
@@ -1048,54 +1179,58 @@ function setStatus(msg) {
 }
 
 /* ---- Synchronized Mainstream Fullscreen (Live Smooth Video) ---- */
-let fsSnapshotTimer = null;
+let fsReconnectTimer = null;
 
 async function fullscreen(dvr, ch) {
   isWebFullscreenActive = true;
   const label = channelLabel(dvr, ch);
-  
+
   const overlay = document.getElementById('webFullscreenOverlay');
   const title = document.getElementById('webFsTitle');
   const video = document.getElementById('webFsVideo');
   const img = document.getElementById('webFsImg');
-  
+
   title.textContent = label + ' (HD Mainstream)';
   overlay.style.display = 'flex';
   video.style.display = 'none';
   img.style.display = 'block';
-  
+
   // 1. Tell Kiosk Wall to switch hardware TV output to 1080p mainstream immediately
   fetch('/api/kiosk/fullscreen', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({dvr, ch})
   }).then(() => setStatus('Kiosk showing ' + label + ' (HD Mainstream)')).catch(() => {});
 
-  // 2. Instantly display live 1080p HD frame from dvrwall memory (<50ms)
-  img.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
-
-  // 3. Smooth double-buffered live refresh loop (300ms interval) for 1080p HD
-  clearInterval(fsSnapshotTimer);
-  const updateFsFrame = () => {
+  // 2. Live HD MJPEG stream, straight from dvrwall: a single persistent
+  // multipart/x-mixed-replace connection that the browser keeps open and
+  // repaints on its own -- no JS polling loop, no re-fetch per frame. This
+  // replaces the old 1000ms JPEG-polling loop, which existed to work
+  // around a decode backlog that dvrwall's own compositor/scheduling fixes
+  // have since eliminated (see dvrwall.c's event-driven compositor and
+  // mainstream load-shedding). If the connection drops, retry after a
+  // short delay rather than leaving a frozen frame on screen.
+  clearTimeout(fsReconnectTimer);
+  const connectFsStream = () => {
     if (!isWebFullscreenActive) return;
-    const nextImg = new Image();
-    nextImg.onload = () => {
-      if (isWebFullscreenActive) {
-        img.src = nextImg.src;
-      }
-    };
-    nextImg.src = '/api/stream/' + dvr + '/' + ch + '/main.jpg?t=' + Date.now();
+    img.src = '/api/live/' + dvr + '/' + ch + '?main=1&t=' + Date.now();
   };
-  fsSnapshotTimer = setInterval(updateFsFrame, 300);
+  img.onerror = () => {
+    if (!isWebFullscreenActive) return;
+    clearTimeout(fsReconnectTimer);
+    fsReconnectTimer = setTimeout(connectFsStream, 2000);
+  };
+  connectFsStream();
 
   await refreshStatus();
 }
 
 async function closeWebFullscreen() {
   isWebFullscreenActive = false;
-  clearInterval(fsSnapshotTimer);
+  clearTimeout(fsReconnectTimer);
   const overlay = document.getElementById('webFullscreenOverlay');
   const video = document.getElementById('webFsVideo');
   const img = document.getElementById('webFsImg');
+  img.onerror = null;
   overlay.style.display = 'none';
   video.pause();
   video.src = '';
@@ -1170,8 +1305,27 @@ async function refreshStatus() {
   } catch(e) {}
 
   if (!editMode) {
-    renderKioskGrid();
-    renderPool();
+    renderKioskGrid(false);
+    renderPool(false);
+  }
+}
+
+let poolThumbTimer = null;
+
+function refreshPoolThumbs() {
+  // Bumps each existing pool tile's snapshot timestamp in place -- no DOM
+  // rebuild, no Sortable churn, no new persistent connections opened. This
+  // is what actually keeps pool thumbnails current now that renderPool()
+  // no longer rebuilds unconditionally every 5s; it also runs independently
+  // of whether renderPool() itself skipped or redrew this tick. 1s matches
+  // dvrwall's MJPEG_FPS_THUMB-backed shared JPEG cache -- polling faster
+  // than the cache actually refreshes would just re-fetch identical bytes.
+  if (isWebFullscreenActive) return;
+  const imgs = document.querySelectorAll('#pool img.live-thumb');
+  for (const img of imgs) {
+    const tile = img.closest('.tile');
+    if (!tile) continue;
+    img.src = '/api/snapshot/' + tile.dataset.dvr + '/' + tile.dataset.ch + '?t=' + Date.now();
   }
 }
 
@@ -1453,8 +1607,13 @@ async function init() {
     await refreshStatus();
   } catch(e) {}
 
-  // Auto-refresh grid and camera thumbnails every 5 seconds (optimized for CPU/temp)
+  // Status/layout poll -- infrequent, since renderPool()/renderKioskGrid()
+  // now only redraw when something actually changed (see their force param).
   setInterval(refreshStatus, 5000);
+  // Pool thumbnail refresh -- decoupled from the above so live thumbnails
+  // don't depend on a layout change happening; see refreshPoolThumbs().
+  clearInterval(poolThumbTimer);
+  poolThumbTimer = setInterval(refreshPoolThumbs, 1000);
 }
 
 document.getElementById('profileSelect').addEventListener('change', async (e) => {
@@ -1732,7 +1891,10 @@ def api_snapshot(dvr_key, ch):
         return "unknown dvr", 404
     if not dvr_reachable(dvr_key):
         return "dvr unreachable", 503
-    
+
+    note_channel_demand(dvr_key, ch)   # keeps this channel in the decode roster
+                                        # while the pool is actively viewing it
+
     key = f"{dvr_key}:{ch}"
     now = time.time()
     with _CACHE_LOCK:
@@ -2073,7 +2235,16 @@ def run_server():
 
             threading.Thread(target=run_http_redirect, daemon=True).start()
 
-            server = create_server(app, host='0.0.0.0', port=443, threads=8)
+            # threads=32: the kiosk-grid mirror and WebUI fullscreen now hold
+            # persistent MJPEG connections open (worst case ~16 grid tiles +
+            # 1 fullscreen), which occupy a worker thread for their whole
+            # lifetime rather than a single request/response. 8 was sized for
+            # short-lived requests only; a live grid view would have
+            # exhausted it and stalled the rest of the dashboard exactly like
+            # the compositor-hang bug this session already fixed once for a
+            # different root cause. 32 gives headroom above the bounded
+            # worst case plus normal API traffic.
+            server = create_server(app, host='0.0.0.0', port=443, threads=32)
             server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
             server.run()
             return
@@ -2082,10 +2253,10 @@ def run_server():
 
     print("[*] SSL certs not found or port 443 unavailable, running plain HTTP on port 80...", flush=True)
     try:
-        waitress.serve(app, host='0.0.0.0', port=80, threads=8)
+        waitress.serve(app, host='0.0.0.0', port=80, threads=32)
     except Exception as e:
         print(f"[!] Failed to bind port 80 ({e}), falling back to port 8080...", flush=True)
-        waitress.serve(app, host='0.0.0.0', port=8080, threads=8)
+        waitress.serve(app, host='0.0.0.0', port=8080, threads=32)
 
 
 if __name__ == '__main__':

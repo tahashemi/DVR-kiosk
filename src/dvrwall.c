@@ -61,23 +61,24 @@
 #define NAME_MAX_LEN 96
 #define SOCK_PATH "/run/dvrwall.sock"
 #define FB_DEV "/dev/fb0"
-#define DEFAULT_FPS 5
-#define MIN_FPS 3
-#define MAX_FPS 8
+#define DEFAULT_FPS 12
 #define THUMB_W 320
 #define THUMB_H 180
 #define HTTP_PORT 8590
-#define MJPEG_FPS 5
+#define MJPEG_FPS_THUMB 3   /* grid/pool thumbnails -- 320x180, cheap to
+                             * re-encode; the substream source itself is
+                             * only 12fps, so there's no benefit going
+                             * higher here */
+#define MJPEG_FPS_MAIN 10   /* fullscreen HD WebUI preview -- a full
+                             * framebuffer-sized re-encode, materially more
+                             * expensive per frame than a thumbnail, so it
+                             * gets its own independently-tunable cap
+                             * instead of sharing one number with the
+                             * thumbnails. Below the 25fps mainstream
+                             * source; the TV path never goes through JPEG
+                             * at all (it blits decoded frames directly),
+                             * only this WebUI preview path does. */
 #define DEMAND_WINDOW_MS 3000   /* stop encoding a channel this long after its last request */
-
-static float get_cpu_load_1m(void) {
-    FILE *f = fopen("/proc/loadavg", "r");
-    if (!f) return 0.0f;
-    float l1 = 0.0f;
-    if (fscanf(f, "%f", &l1) != 1) l1 = 0.0f;
-    fclose(f);
-    return l1;
-}
 
 /* ---------------------------------------------------------------- logging */
 
@@ -161,16 +162,42 @@ static void fb_blank(int on) {
 
 struct stream {
     int used;
+    uint64_t id;                /* monotonic, never reused for the life of the
+                                  * process. Identifies *this* occupant of the
+                                  * slot so a compose_slot built before a
+                                  * teardown/reuse can never be blitted against
+                                  * whatever channel got the index next --
+                                  * see roster_set() and compositor_thread(). */
     char url[URL_MAX];
     char name[NAME_MAX_LEN];   /* basename of url, e.g. "dvr1_ch1" */
 
     pthread_mutex_t lock;
-    uint8_t *slot;             /* BGRA buffer */
-    int slot_w, slot_h;        /* Buffer width and height */
-    uint8_t *thumb_slot;       /* Fixed 320x180 BGRA buffer for HTTP JPEG encoder */
+    uint8_t *slot;              /* front buffer, BGRA, slot_w*slot_h*4 -- what
+                                  * the compositor and thumbnail encoder read */
+    uint8_t *slot_back;         /* back buffer -- sws_scale's target; written
+                                  * with no lock held, then swapped with `slot`
+                                  * under the lock. Removes a full-frame
+                                  * memcpy-under-lock every decoded frame. */
+    int slot_w, slot_h;        /* THUMB_W/THUMB_H for grid substreams; sized to
+                                 * fill the framebuffer for "_main" streams, so
+                                 * fullscreen mainstream isn't decoded at full
+                                 * resolution only to be squashed into a 320x180
+                                 * thumbnail and blown back up on the TV. */
     int have_frame;
     int64_t frame_ms;          /* when the newest frame landed */
     int64_t frames;            /* total decoded+scaled, for measuring real fps */
+    uint64_t seq;               /* bumped every time a new frame is published
+                                  * (front/back swap). Lets the compositor blit
+                                  * only on genuinely new frames instead of on
+                                  * a fixed timer independent of the decoder's
+                                  * -- see compositor_thread(). */
+    uint64_t consumed_seq;      /* seq of the newest frame the compositor has
+                                  * actually displayed. Mainstream-only
+                                  * backpressure signal: if stream_session()
+                                  * sees its last publish still hasn't been
+                                  * consumed, the decoder is outrunning the
+                                  * display and it skips the scale for the next
+                                  * one rather than doing wasted work. */
 
     /* JPEG cache: encoded once per THUMB_FPS tick by thumb_encoder_thread,
      * regardless of how many HTTP viewers are watching this channel. Without
@@ -194,10 +221,14 @@ static struct stream STREAMS[MAX_STREAMS];
 static int NSTREAMS = 0;                 /* count of used roster slots */
 static pthread_mutex_t ROSTER_LOCK = PTHREAD_MUTEX_INITIALIZER;
 static volatile int64_t ROSTER_GEN = 0;  /* bumped on every roster_set/stop_all */
+static uint64_t NEXT_STREAM_ID = 1;      /* guarded by ROSTER_LOCK */
 
 /* What's actually on screen: indices into STREAMS plus tile geometry. */
 struct compose_slot {
     int stream_idx;
+    uint64_t stream_id;    /* must match STREAMS[stream_idx].id or this entry
+                             * is stale (its slot was reused) and is skipped */
+    uint64_t last_seq;     /* seq last blitted -- drives event-driven compositing */
     int x, y, w, h;
 };
 static struct compose_slot COMPOSE[MAX_STREAMS];
@@ -214,22 +245,22 @@ static void stream_session(struct stream *s) {
     AVFormatContext *fmt = NULL;
     AVCodecContext *dec = NULL;
     struct SwsContext *sws = NULL;
-    AVFrame *frame = NULL, *bgra = NULL;
+    AVFrame *frame = NULL;
     AVPacket *pkt = NULL;
-    uint8_t *bgra_buf = NULL;
     int vstream = -1;
 
-    int is_main = (strstr(s->name, "_main") != NULL);
+    int is_main = s->slot_w > THUMB_W;
 
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
     av_dict_set(&opts, "fflags", "nobuffer", 0);
     av_dict_set(&opts, "flags", "low_delay", 0);
-    av_dict_set(&opts, "analyzeduration", is_main ? "1000000" : "500000", 0);
-    av_dict_set(&opts, "probesize", is_main ? "1000000" : "500000", 0);
+    av_dict_set(&opts, "analyzeduration", "0", 0);
+    /* A 1080p mainstream I-frame can be 100-250KB; the 32KB probesize used
+     * for tiny grid substreams truncates it. */
+    av_dict_set(&opts, "probesize", is_main ? "262144" : "32768", 0);
     av_dict_set(&opts, "stimeout", "10000000", 0);   /* 10s socket timeout */
     av_dict_set(&opts, "max_delay", "0", 0);
-    av_dict_set(&opts, "buffer_size", is_main ? "1048576" : "131072", 0);
 
     if (avformat_open_input(&fmt, s->url, NULL, &opts) < 0) goto done;
     if (avformat_find_stream_info(fmt, NULL) < 0) goto done;
@@ -244,57 +275,39 @@ static void stream_session(struct stream *s) {
     if (!codec) goto done;
     dec = avcodec_alloc_context3(codec);
     if (!dec || avcodec_parameters_to_context(dec, par) < 0) goto done;
-    dec->thread_count = is_main ? 4 : 1;              /* multi-thread 1080p mainstream for zero lag */
+    /* Grid substreams are tiny (CIF-ish) -- one thread is plenty and extra
+     * threads just add overhead. A "_main" fullscreen stream is full
+     * resolution and is the only thing being decoded while fullscreen is
+     * active (see dvr_control.py's launch_fullscreen), so it can use extra
+     * decode threads -- but ONLY slice-threading (FF_THREAD_SLICE), never
+     * frame-threading. FFmpeg's default with thread_count>1 is to also
+     * allow frame-threading, which decodes N whole frames in a pipeline and
+     * only emits the first one after all N are done -- exactly backwards
+     * for live video, and most consumer DVRs encode single-slice frames
+     * anyway (so slice-threading buys nothing here and just adds thread
+     * overhead). This was silently turning fullscreen into a growing,
+     * multi-second backlog under load, observed live via STATUS: frame age
+     * climbing from tens of ms to 9+ seconds before snapping back once the
+     * backlog drained. */
+    dec->thread_count = (s->slot_w > THUMB_W) ? 2 : 1;
     dec->thread_type = FF_THREAD_SLICE;
     dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
-    dec->flags2 |= AV_CODEC_FLAG2_FAST;
     if (avcodec_open2(dec, codec, NULL) < 0) goto done;
 
-    int target_w = s->slot_w > 0 ? s->slot_w : THUMB_W;
-    int target_h = s->slot_h > 0 ? s->slot_h : THUMB_H;
-
     frame = av_frame_alloc();
-    bgra = av_frame_alloc();
     pkt = av_packet_alloc();
-    if (!frame || !bgra || !pkt) goto done;
+    if (!frame || !pkt) goto done;
 
-    int need = av_image_get_buffer_size(AV_PIX_FMT_BGRA, target_w, target_h, 1);
-    bgra_buf = av_malloc(need);
-    if (!bgra_buf) goto done;
-    av_image_fill_arrays(bgra->data, bgra->linesize, bgra_buf,
-                         AV_PIX_FMT_BGRA, target_w, target_h, 1);
+    int sw = s->slot_w, sh = s->slot_h;
+    int stride = sw * 4;
 
     s->connected = 1;
-    logmsg("stream[%s]: connected (%dx%d)", s->name, target_w, target_h);
-
-    int64_t last_load_check = 0;
-    int draining = is_main ? 1 : 0;
-    int64_t stream_start_ms = now_ms();
+    logmsg("stream[%s]: connected", s->name);
 
     while (RUN && s->running) {
         int r = av_read_frame(fmt, pkt);
         if (r < 0) break;
         if (pkt->stream_index != vstream) { av_packet_unref(pkt); continue; }
-
-        /* Initial burst backlog drain for mainstream: skip historical non-keyframes to hit live edge */
-        if (draining) {
-            if (now_ms() - stream_start_ms > 1500) {
-                draining = 0;
-            } else if (!(pkt->flags & AV_PKT_FLAG_KEY)) {
-                av_packet_unref(pkt);
-                continue;
-            }
-        }
-
-        if (!is_main) {
-            int64_t tnow = now_ms();
-            if (tnow - last_load_check > 2000) {
-                last_load_check = tnow;
-                float load = get_cpu_load_1m();
-                /* If 4-core SBC load is above ~55% (loadavg > 2.2), skip non-reference frames */
-                dec->skip_frame = (load > 2.2f) ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
-            }
-        }
 
         r = avcodec_send_packet(dec, pkt);
         av_packet_unref(pkt);
@@ -303,42 +316,50 @@ static void stream_session(struct stream *s) {
         while (avcodec_receive_frame(dec, frame) == 0) {
             if (!sws) {
                 sws = sws_getContext(dec->width, dec->height, dec->pix_fmt,
-                                     target_w, target_h, AV_PIX_FMT_BGRA,
-                                     is_main ? SWS_BILINEAR : SWS_FAST_BILINEAR,
-                                     NULL, NULL, NULL);
+                                     sw, sh, AV_PIX_FMT_BGRA,
+                                     SWS_FAST_BILINEAR, NULL, NULL, NULL);
                 if (!sws) { av_frame_unref(frame); goto done; }
             }
 
-            sws_scale(sws, (const uint8_t *const *)frame->data, frame->linesize,
-                      0, dec->height, bgra->data, bgra->linesize);
-
-            /* Overwrite, never queue -- this is what bounds latency. */
-            pthread_mutex_lock(&s->lock);
-            if (s->slot) {
-                for (int row = 0; row < target_h; row++) {
-                    memcpy(s->slot + (size_t)row * target_w * 4,
-                           bgra->data[0] + (size_t)row * bgra->linesize[0],
-                           (size_t)target_w * 4);
-                }
-                if (s->thumb_slot) {
-                    if (target_w == THUMB_W && target_h == THUMB_H) {
-                        memcpy(s->thumb_slot, bgra->data[0], (size_t)THUMB_W * THUMB_H * 4);
-                    } else {
-                        for (int row = 0; row < THUMB_H; row++) {
-                            int sy = row * target_h / THUMB_H;
-                            const uint32_t *src_row = (const uint32_t *)(bgra->data[0] + (size_t)sy * bgra->linesize[0]);
-                            uint32_t *dst_row = (uint32_t *)(s->thumb_slot + (size_t)row * THUMB_W * 4);
-                            for (int col = 0; col < THUMB_W; col++) {
-                                int sx = col * target_w / THUMB_W;
-                                dst_row[col] = src_row[sx];
-                            }
-                        }
-                    }
-                }
-                s->have_frame = 1;
-                s->frame_ms = now_ms();
-                s->frames++;
+            /* Mainstream-only load shedding: the DVR's mainstream runs at its
+             * own native fps (often higher than anything the compositor
+             * needs -- e.g. 25fps for a stream only ever displayed at up to
+             * COMPOSITOR_HZ), so the decoder can outrun the display under
+             * load. If the frame we published last time hasn't been shown
+             * yet, this one would only ever overwrite it unseen -- skip the
+             * expensive scale-and-publish and keep decoding (decode itself
+             * can't be skipped; Baseline profile has no B-frames, so every
+             * frame is a reference frame -- see stream_session's caller
+             * comment history / plan notes). Grid substreams don't need
+             * this: they're cheap and, per ensure_roster() in
+             * dvr_control.py, are only ever roster'd while on screen. */
+            if (is_main) {
+                pthread_mutex_lock(&s->lock);
+                int behind = s->have_frame && s->seq != s->consumed_seq;
+                pthread_mutex_unlock(&s->lock);
+                if (behind) { av_frame_unref(frame); continue; }
             }
+
+            pthread_mutex_lock(&s->lock);
+            uint8_t *back = s->slot_back;
+            pthread_mutex_unlock(&s->lock);
+
+            uint8_t *dst_data[4]     = { back, NULL, NULL, NULL };
+            int      dst_linesize[4] = { stride, 0, 0, 0 };
+            sws_scale(sws, (const uint8_t *const *)frame->data, frame->linesize,
+                      0, dec->height, dst_data, dst_linesize);
+
+            /* Publish by swapping front/back -- no frame data is copied
+             * here, sws_scale already wrote straight into `back`. This
+             * replaces the old row-by-row memcpy-under-lock (~55MB/s across
+             * the roster) with a pointer swap. */
+            pthread_mutex_lock(&s->lock);
+            s->slot_back = s->slot;
+            s->slot = back;
+            s->have_frame = 1;
+            s->frame_ms = now_ms();
+            s->frames++;
+            s->seq++;
             pthread_mutex_unlock(&s->lock);
             av_frame_unref(frame);
         }
@@ -347,10 +368,8 @@ static void stream_session(struct stream *s) {
 done:
     s->connected = 0;
     if (sws) sws_freeContext(sws);
-    if (bgra_buf) av_freep(&bgra_buf);
     if (pkt) av_packet_free(&pkt);
     if (frame) av_frame_free(&frame);
-    if (bgra) av_frame_free(&bgra);
     if (dec) avcodec_free_context(&dec);
     if (fmt) avformat_close_input(&fmt);
     av_dict_free(&opts);
@@ -377,6 +396,9 @@ static void compose_clear_locked(void) {
 }
 
 static void roster_stop_all(void) {
+    /* Clear the compose list (under COMPOSE_LOCK) *before* touching any
+     * stream, so no future compositor pass can reference a STREAMS[] entry
+     * we're about to tear down. */
     pthread_mutex_lock(&COMPOSE_LOCK);
     compose_clear_locked();
     pthread_mutex_unlock(&COMPOSE_LOCK);
@@ -384,16 +406,23 @@ static void roster_stop_all(void) {
     pthread_mutex_lock(&ROSTER_LOCK);
     for (int i = 0; i < MAX_STREAMS; i++)
         if (STREAMS[i].used) STREAMS[i].running = 0;
+    /* Wait for every decoder thread to actually exit before freeing
+     * anything. Deliberately not under COMPOSE_LOCK -- NCOMPOSE is already 0
+     * above, so the compositor has nothing left to reach into here, and this
+     * join can take up to the ~10s socket timeout per stream. */
+    for (int i = 0; i < MAX_STREAMS; i++)
+        if (STREAMS[i].used) pthread_join(STREAMS[i].tid, NULL);
+
+    pthread_mutex_lock(&COMPOSE_LOCK);   /* defense in depth, see roster_set() */
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (STREAMS[i].used) {
-            pthread_join(STREAMS[i].tid, NULL);
             free(STREAMS[i].slot);
-            STREAMS[i].slot = NULL;
-            if (STREAMS[i].thumb_slot) { free(STREAMS[i].thumb_slot); STREAMS[i].thumb_slot = NULL; }
+            free(STREAMS[i].slot_back);
             av_freep(&STREAMS[i].jpeg);
-            STREAMS[i].used = 0;
+            memset(&STREAMS[i], 0, sizeof STREAMS[i]);
         }
     }
+    pthread_mutex_unlock(&COMPOSE_LOCK);
     NSTREAMS = 0;
     ROSTER_GEN++;
     pthread_mutex_unlock(&ROSTER_LOCK);
@@ -423,7 +452,20 @@ static int roster_find_locked(const char *name) {
  * moving a used slot: kept streams stay at their existing index for their
  * entire lifetime; only genuinely-removed slots are torn down (and only
  * after their thread has actually exited via pthread_join), and only new
- * URLs are placed into free slots. */
+ * URLs are placed into free slots.
+ *
+ * Second invariant, added after the above fix did not fully stop the
+ * crashes: freeing a torn-down slot's buffers and zeroing its struct
+ * (mutex included) must never happen concurrently with compositor_thread()
+ * dereferencing that same struct through a compose_slot. The two used to be
+ * serialised by nothing at all -- this function only ever took ROSTER_LOCK,
+ * which compositor_thread() never acquires -- so the compositor could lock
+ * a just-zeroed mutex or blit from just-freed memory. Fixed by taking
+ * COMPOSE_LOCK around the free+memset step specifically (not around the
+ * potentially slow pthread_join -- see the phase comments below). Related:
+ * compose_slot now also carries the stream's `id`, so even a slot that gets
+ * torn down and reused for a *different* channel before the compositor's
+ * next pass can never be blitted under a stale mapping. */
 static void roster_set(char urls[][URL_MAX], int n) {
     if (n > MAX_STREAMS) n = MAX_STREAMS;
     pthread_mutex_lock(&ROSTER_LOCK);
@@ -431,7 +473,8 @@ static void roster_set(char urls[][URL_MAX], int n) {
     int url_matched[MAX_STREAMS];
     memset(url_matched, 0, sizeof url_matched);
 
-    /* Mark no-longer-wanted slots for shutdown; leave wanted ones untouched. */
+    /* Phase 1: mark no-longer-wanted slots for shutdown; leave wanted ones
+     * untouched. Nothing here is visible to the compositor yet. */
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (!STREAMS[i].used) continue;
         int found = -1;
@@ -440,19 +483,36 @@ static void roster_set(char urls[][URL_MAX], int n) {
         if (found >= 0) url_matched[found] = 1;
         else STREAMS[i].running = 0;
     }
-    /* Only now, after the thread has actually exited, is it safe to zero
-     * this specific slot -- never the whole array. */
+
+    /* Phase 2: wait for those decoder threads to actually exit. Deliberately
+     * NOT under COMPOSE_LOCK -- stream_session() can take up to its ~10s
+     * socket timeout to unwind, and the compositor must keep blitting the
+     * still-valid, still-allocated slot throughout, not stall for 10s. */
+    for (int i = 0; i < MAX_STREAMS; i++)
+        if (STREAMS[i].used && !STREAMS[i].running)
+            pthread_join(STREAMS[i].tid, NULL);
+
+    /* Phase 3: now that every torn-down stream's thread has genuinely
+     * exited (nothing is writing its slot any more), free and zero it. This
+     * is the only part that actually invalidates memory the compositor
+     * might touch, so it's the only part that needs to be mutually
+     * exclusive with compositor_thread()'s blit pass -- hence COMPOSE_LOCK,
+     * held only for this brief step. */
+    pthread_mutex_lock(&COMPOSE_LOCK);
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (STREAMS[i].used && !STREAMS[i].running) {
-            pthread_join(STREAMS[i].tid, NULL);
             free(STREAMS[i].slot);
-            if (STREAMS[i].thumb_slot) free(STREAMS[i].thumb_slot);
+            free(STREAMS[i].slot_back);
             av_freep(&STREAMS[i].jpeg);
             memset(&STREAMS[i], 0, sizeof STREAMS[i]);
         }
     }
+    pthread_mutex_unlock(&COMPOSE_LOCK);
 
-    /* Start any wanted URL that isn't already running, into a free slot. */
+    /* Phase 4: start any wanted URL that isn't already running, into a free
+     * slot. A free slot can't be referenced by any existing compose_slot
+     * (those only ever point at slots that were `used` when created, and
+     * the id check guards against reuse), so no COMPOSE_LOCK needed here. */
     for (int j = 0; j < n; j++) {
         if (url_matched[j]) continue;
         int slot = -1;
@@ -464,12 +524,14 @@ static void roster_set(char urls[][URL_MAX], int n) {
         pthread_mutex_init(&s->lock, NULL);
         snprintf(s->url, URL_MAX, "%s", urls[j]);
         url_basename(urls[j], s->name, sizeof s->name);
-
-        int is_main = (strstr(s->name, "_main") != NULL);
-        s->slot_w = is_main ? (FB.w > 0 ? FB.w : 1920) : THUMB_W;
-        s->slot_h = is_main ? (FB.h > 0 ? FB.h : 1080) : THUMB_H;
-        s->slot = calloc(1, (size_t)s->slot_w * s->slot_h * 4);
-        s->thumb_slot = calloc(1, (size_t)THUMB_W * THUMB_H * 4);
+        size_t nlen = strlen(s->name);
+        int is_main = nlen > 5 && strcmp(s->name + nlen - 5, "_main") == 0;
+        s->slot_w = is_main ? FB.w : THUMB_W;
+        s->slot_h = is_main ? FB.h : THUMB_H;
+        size_t need = (size_t)s->slot_w * s->slot_h * 4;
+        s->slot = calloc(1, need);
+        s->slot_back = calloc(1, need);
+        s->id = NEXT_STREAM_ID++;
         s->running = 1;
         s->used = 1;
         pthread_create(&s->tid, NULL, stream_thread, s);
@@ -507,6 +569,8 @@ static void compose_set(char urls[][URL_MAX], int n) {
         int idx = roster_find_locked(name);
         if (idx < 0) { logmsg("layout: %s not in roster, skipped", name); continue; }
         COMPOSE[m].stream_idx = idx;
+        COMPOSE[m].stream_id = STREAMS[idx].id;
+        COMPOSE[m].last_seq = (uint64_t)-1;   /* force an immediate first blit */
         COMPOSE[m].x = (i % cols) * tw;
         COMPOSE[m].y = (i / cols) * th;
         COMPOSE[m].w = tw;
@@ -522,59 +586,56 @@ static void compose_set(char urls[][URL_MAX], int n) {
 
 /* ------------------------------------------------------------ compositor */
 
-/* Nearest-neighbour scale-blit from the slot into a dw x dh region of the framebuffer.
- * Falls back to a straight memcpy per row when sizes match (the common 1080p fullscreen
- * and grid cases), so it stays on the ultra-cheap, zero-lag memcpy path. */
-static void blit_tile(const uint8_t *slot, int slot_w, int slot_h, int dx, int dy, int dw, int dh) {
-    if (!slot || slot_w <= 0 || slot_h <= 0) return;
-    if (dw == slot_w && dh == slot_h) {
+/* Nearest-neighbour scale-blit from a sw x sh source slot into a dw x dh
+ * region of the framebuffer at (dx,dy). Falls back to a straight memcpy per
+ * row when sizes match (the common grid case, and also the common
+ * fullscreen-mainstream case now that mainstream slots are sized to the
+ * framebuffer), which is what actually runs at 12fps for every tile, so it
+ * stays on the cheap path. */
+static void blit_tile(const uint8_t *slot, int sw, int sh, int dx, int dy, int dw, int dh) {
+    if (dw == sw && dh == sh) {
         for (int row = 0; row < dh; row++) {
             int fy = dy + row;
             if (fy < 0 || fy >= FB.h) continue;
             memcpy(FB.mem + (size_t)fy * FB.stride + (size_t)dx * 4,
-                   slot + (size_t)row * slot_w * 4, (size_t)dw * 4);
+                   slot + (size_t)row * sw * 4, (size_t)dw * 4);
         }
         return;
     }
     for (int row = 0; row < dh; row++) {
         int fy = dy + row;
         if (fy < 0 || fy >= FB.h) continue;
-        int sy = row * slot_h / dh;
+        int sy = row * sh / dh;
         uint32_t *dst = (uint32_t *)(FB.mem + (size_t)fy * FB.stride + (size_t)dx * 4);
-        const uint32_t *src = (const uint32_t *)(slot + (size_t)sy * slot_w * 4);
+        const uint32_t *src = (const uint32_t *)(slot + (size_t)sy * sw * 4);
         for (int col = 0; col < dw; col++) {
-            int sx = col * slot_w / dw;
+            int sx = col * sw / dw;
             dst[col] = src[sx];
         }
     }
 }
 
+/* Runs well above any decoder's fps (grid substreams ~12fps, mainstream up
+ * to whatever the DVR sends) purely so a new frame is picked up promptly;
+ * the seq check below means a tile is only actually re-blitted when its
+ * stream really published something new, so the extra ticks cost almost
+ * nothing (an integer compare) rather than N redundant full blits/sec. This
+ * decouples display cadence from the compositor's own timer -- see the seq
+ * field comment on struct stream for why that matters. */
+#define COMPOSITOR_HZ 30
+
 static void *compositor_thread(void *arg) {
     (void)arg;
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
-    int tick = 0;
 
     while (RUN) {
-        long period_ns = 1000000000L / (TARGET_FPS > 0 ? TARGET_FPS : DEFAULT_FPS);
+        long period_ns = 1000000000L / COMPOSITOR_HZ;
         next.tv_nsec += period_ns;
         while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
 
         if (BLANKED) continue;
-
-        /* Adaptive Framerate Governor: Check CPU load every 3 seconds */
-        if (++tick % 24 == 0) {
-            float load = get_cpu_load_1m();
-            /* On a 4-core board, load > 3.2 means > 80% CPU utilization */
-            if (load > 3.2f && TARGET_FPS > MIN_FPS) {
-                TARGET_FPS--;
-                logmsg("governor: cpu load high (%.2f > 80%%), lowered framerate to %d fps", load, TARGET_FPS);
-            } else if (load < 2.0f && TARGET_FPS < DEFAULT_FPS && NCOMPOSE > 1) {
-                TARGET_FPS++;
-                logmsg("governor: cpu load low (%.2f < 50%%), restored framerate to %d fps", load, TARGET_FPS);
-            }
-        }
 
         pthread_mutex_lock(&COMPOSE_LOCK);
         if (FB_DIRTY) { memset(FB.mem, 0, FB.len); FB_DIRTY = 0; }
@@ -582,13 +643,19 @@ static void *compositor_thread(void *arg) {
         for (int i = 0; i < NCOMPOSE; i++) {
             struct compose_slot *c = &COMPOSE[i];
             struct stream *s = &STREAMS[c->stream_idx];
-            if (!s->used) continue;
+            /* id check: guards against a torn-down-and-reused slot index
+             * being blitted under a stale mapping -- see roster_set(). */
+            if (!s->used || s->id != c->stream_id) continue;
             pthread_mutex_lock(&s->lock);
-            if (s->have_frame && s->slot) {
-                int sw = s->slot_w > 0 ? s->slot_w : THUMB_W;
-                int sh = s->slot_h > 0 ? s->slot_h : THUMB_H;
-                blit_tile(s->slot, sw, sh, c->x, c->y, c->w, c->h);
+            if (s->have_frame && s->slot && s->seq != c->last_seq) {
+                blit_tile(s->slot, s->slot_w, s->slot_h, c->x, c->y, c->w, c->h);
+                c->last_seq = s->seq;
             }
+            /* Mark the newest published frame as displayed regardless of
+             * whether this tick needed a fresh blit -- this is the
+             * backpressure signal stream_session() reads for mainstream
+             * load-shedding (see struct stream's consumed_seq comment). */
+            s->consumed_seq = s->seq;
             pthread_mutex_unlock(&s->lock);
         }
         pthread_mutex_unlock(&COMPOSE_LOCK);
@@ -738,6 +805,7 @@ struct jpeg_enc {
     uint8_t *yuv_buf;
     AVPacket *pkt;
     int64_t pts;
+    int w, h;                  /* size this encoder is currently configured for */
 };
 
 static int jpeg_enc_init(struct jpeg_enc *je, int w, int h) {
@@ -764,23 +832,38 @@ static int jpeg_enc_init(struct jpeg_enc *je, int w, int h) {
     je->yuv->height = h;
     je->yuv->format = AV_PIX_FMT_YUVJ420P;
     je->pkt = av_packet_alloc();
+    je->w = w;
+    je->h = h;
     return (je->sws && je->yuv && je->yuv_buf && je->pkt) ? 0 : -1;
 }
 
 static void jpeg_enc_free(struct jpeg_enc *je) {
-    if (je->sws) { sws_freeContext(je->sws); je->sws = NULL; }
+    if (je->sws) sws_freeContext(je->sws);
     if (je->yuv_buf) av_freep(&je->yuv_buf);
     if (je->yuv) av_frame_free(&je->yuv);
     if (je->pkt) av_packet_free(&je->pkt);
     if (je->ctx) avcodec_free_context(&je->ctx);
+    memset(je, 0, sizeof *je);
 }
 
-/* Encode one BGRA slot to a JPEG buffer. Returns malloc'd data (caller frees
- * with av_free) via *out, length via *outlen. 0 on success. */
-static int jpeg_encode(struct jpeg_enc *je, const uint8_t *bgra, int w, int h, uint8_t **out, int *outlen) {
+/* (Re)configure an encoder for a given size, reusing it as-is if already
+ * configured for that size. Streams are either all THUMB_W x THUMB_H (grid
+ * mode) or a single framebuffer-sized mainstream (fullscreen mode) -- never
+ * a mix -- so in practice this only actually reinitializes when switching
+ * between those two modes, not per-stream. */
+static int jpeg_enc_ensure(struct jpeg_enc *je, int w, int h) {
+    if (je->ctx && je->w == w && je->h == h) return 0;
+    if (je->ctx) jpeg_enc_free(je);
+    return jpeg_enc_init(je, w, h);
+}
+
+/* Encode one BGRA slot (w x h, matching how je was last configured) to a
+ * JPEG buffer. Returns malloc'd data (caller frees with av_free) via *out,
+ * length via *outlen. 0 on success. */
+static int jpeg_encode(struct jpeg_enc *je, const uint8_t *bgra, uint8_t **out, int *outlen) {
     uint8_t *planes[1] = { (uint8_t *)bgra };
-    int stride[1] = { w * 4 };
-    sws_scale(je->sws, (const uint8_t *const *)planes, stride, 0, h,
+    int stride[1] = { je->w * 4 };
+    sws_scale(je->sws, (const uint8_t *const *)planes, stride, 0, je->h,
               je->yuv->data, je->yuv->linesize);
     je->yuv->pts = je->pts++;   /* must strictly increase or send_frame errors */
     int r = avcodec_send_frame(je->ctx, je->yuv);
@@ -798,24 +881,26 @@ static int jpeg_encode(struct jpeg_enc *je, const uint8_t *bgra, int w, int h, u
 /* Background thread: encodes every roster channel's current frame to JPEG
  * once per tick and caches it on the stream, so any number of HTTP viewers
  * (grid tile + pool tile + multiple browser tabs, all possibly watching the
- * same channel) cost nothing extra -- they just read the cached bytes. */
+ * same channel) cost nothing extra -- they just read the cached bytes.
+ *
+ * ROSTER_LOCK is only held for brief O(1) checks here, never across the
+ * (slow, ~ms-scale) encode itself -- holding it for the whole 28-channel
+ * pass serialised every HTTP reader behind the encoder and collapsed
+ * measured throughput to under 1fps with ~40 concurrent viewers. ROSTER_GEN
+ * detects the rare case where roster_set() reassigns this index to a
+ * different channel mid-encode, so a stale result is dropped instead of
+ * corrupting the new channel's cache. */
 static void *thumb_encoder_thread(void *arg) {
     (void)arg;
-    struct jpeg_enc je_thumb = {0};
-    struct jpeg_enc je_main = {0};
-    if (jpeg_enc_init(&je_thumb, THUMB_W, THUMB_H) < 0) { logmsg("thumb: jpeg encoder init failed"); return NULL; }
-    
-    jpeg_enc_init(&je_main, 1920, 1080);
-
-    uint8_t *scratch_thumb = av_malloc((size_t)THUMB_W * THUMB_H * 4);
-    uint8_t *scratch_main = av_malloc((size_t)1920 * 1080 * 4);
-    if (!scratch_thumb || !scratch_main) {
-        if (scratch_thumb) av_free(scratch_thumb);
-        if (scratch_main) av_free(scratch_main);
-        jpeg_enc_free(&je_thumb);
-        jpeg_enc_free(&je_main);
-        return NULL;
-    }
+    struct jpeg_enc je = {0};
+    if (jpeg_enc_init(&je, THUMB_W, THUMB_H) < 0) { logmsg("thumb: jpeg encoder init failed"); return NULL; }
+    /* Sized for the largest possible slot -- THUMB_W x THUMB_H grid
+     * substreams, or a single framebuffer-sized "_main" fullscreen stream
+     * (never both at once, see ensure_roster() in dvr_control.py). */
+    size_t max_px = (size_t)THUMB_W * THUMB_H;
+    if ((size_t)FB.w * FB.h > max_px) max_px = (size_t)FB.w * FB.h;
+    uint8_t *scratch = av_malloc(max_px * 4);
+    if (!scratch) { jpeg_enc_free(&je); return NULL; }
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
@@ -832,28 +917,29 @@ static void *thumb_encoder_thread(void *arg) {
             pthread_mutex_lock(&s->lock);
             int have = s->have_frame;
             int64_t requested = s->requested_ms;
-            int is_main = (strstr(s->name, "_main") != NULL);
-            int enc_w = is_main ? (s->slot_w > 0 ? s->slot_w : 1920) : THUMB_W;
-            int enc_h = is_main ? (s->slot_h > 0 ? s->slot_h : 1080) : THUMB_H;
-            if (enc_w > 1920) enc_w = 1920;
-            if (enc_h > 1080) enc_h = 1080;
-            uint8_t *src = is_main ? s->slot : (s->thumb_slot ? s->thumb_slot : s->slot);
-            uint8_t *scratch = is_main ? scratch_main : scratch_thumb;
-
-            if (have && src && scratch) memcpy(scratch, src, (size_t)enc_w * enc_h * 4);
+            int64_t last_jpeg = s->jpeg_ms;
+            int sw = s->slot_w, sh = s->slot_h;
+            if (have && s->slot) memcpy(scratch, s->slot, (size_t)sw * sh * 4);
             pthread_mutex_unlock(&s->lock);
-            if (!have || !src || !scratch) continue;
-
+            if (!have) continue;
+            /* Nobody's asked for this channel recently -- decoding stays on
+             * (cheap, and needed for the TV grid regardless), but skip the
+             * JPEG encode. This is what keeps an idle dashboard from paying
+             * continuous encode cost for channels nobody is looking at;
+             * roster_get_jpeg's synchronous fallback covers the next time
+             * someone actually opens it. */
             if (requested == 0 || tick_now - requested > DEMAND_WINDOW_MS) continue;
+            /* This loop ticks at MJPEG_FPS_MAIN (the faster of the two
+             * rates) so fullscreen stays responsive; thumbnails don't need
+             * that cadence, so a non-main stream is only actually
+             * re-encoded once its own slower MJPEG_FPS_THUMB interval has
+             * elapsed, even though every stream is visited every tick. */
+            int is_main = sw > THUMB_W;
+            if (!is_main && tick_now - last_jpeg < 1000 / MJPEG_FPS_THUMB) continue;
 
+            if (jpeg_enc_ensure(&je, sw, sh) < 0) continue;
             uint8_t *jpg = NULL; int jlen = 0;
-            struct jpeg_enc *enc = is_main ? &je_main : &je_thumb;
-            if (!enc->ctx || enc->ctx->width != enc_w || enc->ctx->height != enc_h) {
-                jpeg_enc_free(enc);
-                memset(enc, 0, sizeof *enc);
-                if (jpeg_enc_init(enc, enc_w, enc_h) < 0) continue;
-            }
-            if (jpeg_encode(enc, scratch, enc_w, enc_h, &jpg, &jlen) != 0) continue;
+            if (jpeg_encode(&je, scratch, &jpg, &jlen) != 0) continue;
 
             pthread_mutex_lock(&ROSTER_LOCK);
             if (ROSTER_GEN == gen && STREAMS[i].used) {
@@ -869,19 +955,21 @@ static void *thumb_encoder_thread(void *arg) {
             if (jpg) av_free(jpg);   /* roster changed under us; discard */
         }
 
-        next.tv_nsec += 1000000000L / MJPEG_FPS;
+        next.tv_nsec += 1000000000L / MJPEG_FPS_MAIN;
         while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
-    av_free(scratch_thumb);
-    av_free(scratch_main);
-    jpeg_enc_free(&je_thumb);
-    jpeg_enc_free(&je_main);
+    av_free(scratch);
+    jpeg_enc_free(&je);
     return NULL;
 }
 
 /* Copy the cached JPEG for a channel and mark it as currently wanted (so
- * thumb_encoder_thread keeps refreshing it -- see DEMAND_WINDOW_MS). */
+ * thumb_encoder_thread keeps refreshing it -- see DEMAND_WINDOW_MS). Returns
+ * -1 if the channel isn't in the roster, or has no cached JPEG yet (either
+ * genuinely no frame decoded yet, or it's an idle channel the encoder has
+ * stopped refreshing; caller falls back to a one-off synchronous encode in
+ * that case, see roster_get_jpeg). */
 static int roster_copy_jpeg(const char *name, uint8_t **out, int *outlen) {
     pthread_mutex_lock(&ROSTER_LOCK);
     int idx = roster_find_locked(name);
@@ -899,8 +987,11 @@ static int roster_copy_jpeg(const char *name, uint8_t **out, int *outlen) {
     return ok;
 }
 
-/* Cache hit -> free. Cache miss or high-resolution mainstream request ->
- * synchronous encode straight from the raw decoded slot. */
+/* Cache hit -> free. Cache miss (channel just came under demand, or the
+ * encoder hasn't caught up yet) -> one-off synchronous encode straight from
+ * the raw decoded slot, using a connection-local encoder passed in by the
+ * caller. Keeps first-view latency low without paying continuous per-viewer
+ * encode cost once the shared cache is warm. */
 static int roster_get_jpeg(const char *name, struct jpeg_enc *fallback_je,
                             uint8_t **out, int *outlen) {
     if (roster_copy_jpeg(name, out, outlen) == 0) return 0;
@@ -912,26 +1003,19 @@ static int roster_get_jpeg(const char *name, struct jpeg_enc *fallback_je,
     pthread_mutex_lock(&s->lock);
     s->requested_ms = now_ms();
     int have = s->have_frame;
-    int is_main = (strstr(s->name, "_main") != NULL);
-    int src_w = is_main ? (s->slot_w > 0 ? s->slot_w : 1280) : THUMB_W;
-    int src_h = is_main ? (s->slot_h > 0 ? s->slot_h : 720) : THUMB_H;
-    uint8_t *src = (is_main && s->slot) ? s->slot : (s->thumb_slot ? s->thumb_slot : s->slot);
+    int sw = s->slot_w, sh = s->slot_h;
     uint8_t *scratch = NULL;
-    if (have && src && src_w > 0 && src_h > 0) {
-        scratch = av_malloc((size_t)src_w * src_h * 4);
-        if (scratch) memcpy(scratch, src, (size_t)src_w * src_h * 4);
+    if (have && s->slot) {
+        scratch = av_malloc((size_t)sw * sh * 4);
+        if (scratch) memcpy(scratch, s->slot, (size_t)sw * sh * 4);
     }
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_unlock(&ROSTER_LOCK);
 
     if (!scratch) return -1;   /* known channel, but nothing decoded yet */
 
-    if (!fallback_je->ctx || fallback_je->ctx->width != src_w || fallback_je->ctx->height != src_h) {
-        jpeg_enc_free(fallback_je);
-        memset(fallback_je, 0, sizeof *fallback_je);
-        if (jpeg_enc_init(fallback_je, src_w, src_h) < 0) { av_free(scratch); return -1; }
-    }
-    int r = jpeg_encode(fallback_je, scratch, src_w, src_h, out, outlen);
+    if (jpeg_enc_ensure(fallback_je, sw, sh) < 0) { av_free(scratch); return -1; }
+    int r = jpeg_encode(fallback_je, scratch, out, outlen);
     av_free(scratch);
     return r;
 }
@@ -956,6 +1040,8 @@ static void handle_http(int fd) {
     int is_jpeg = strncmp(path, "/jpeg/", 6) == 0;
     if (!is_mjpeg && !is_jpeg) { http_404(fd); return; }
     const char *name = path + (is_mjpeg ? 7 : 6);
+    size_t name_len = strlen(name);
+    int name_is_main = name_len > 5 && strcmp(name + name_len - 5, "_main") == 0;
 
     /* Only used as a fallback when the shared cache is cold (channel just
      * came under demand, or thumb_encoder_thread hasn't caught up in the
@@ -979,7 +1065,7 @@ static void handle_http(int fd) {
         return;
     }
 
-    /* MJPEG: multipart/x-mixed-replace at MJPEG_FPS while the client (an
+    /* MJPEG: multipart/x-mixed-replace at MJPEG_FPS_MAIN/_THUMB while the client (an
      * <img> tag) keeps the connection open. Every request here also marks
      * the channel as under demand (see roster_copy_jpeg), so after the
      * first frame or two the shared cache is warm and the fallback encoder
@@ -1015,7 +1101,7 @@ static void handle_http(int fd) {
         } else {
             break;   /* channel removed from roster, or never got a frame */
         }
-        next.tv_nsec += 1000000000L / MJPEG_FPS;
+        next.tv_nsec += 1000000000L / (name_is_main ? MJPEG_FPS_MAIN : MJPEG_FPS_THUMB);
         while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
