@@ -94,6 +94,17 @@ def set_fps(target_fps):
     return _send(f"FPS {max(1, min(30, int(target_fps)))}")
 
 
+def set_stride(stride):
+    """Dynamically set the post-decode scale skip stride in dvrwall.
+    
+    1 = 1-of-1 (every decoded frame is scaled to BGRA and displayed)
+    2 = 1-of-2 (50% scale savings)
+    4 = 1-of-4 (75% scale savings)
+    8 = 1-of-8 (emergency heat relief)
+    """
+    return _send(f"STRIDE {max(1, min(16, int(stride)))}")
+
+
 def set_jpeg_fps(thumb_fps, main_fps):
     """Set the WebUI-preview JPEG re-encode rate (grid/pool thumbnails and
     the fullscreen live-preview cache). Independent of set_fps()/TARGET_FPS

@@ -104,12 +104,7 @@ python3 -m venv "${INSTALL_DIR}/venv"
 "${INSTALL_DIR}/venv/bin/pip" install --upgrade pip -q
 "${INSTALL_DIR}/venv/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q
 
-echo -e "${GREEN}[7/8] Generating SSL Certificates & Security Hardening...${NC}"
-if [ ! -f "${CERTS_DIR}/dvr-kiosk.pem" ]; then
-  openssl req -x509 -newkey rsa:2048 -keyout "${CERTS_DIR}/dvr-kiosk-key.pem" \
-    -out "${CERTS_DIR}/dvr-kiosk.pem" -days 3650 -nodes -subj "/CN=dvr-kiosk" 2>/dev/null
-  chmod 600 "${CERTS_DIR}/dvr-kiosk-key.pem"
-fi
+echo -e "${GREEN}[7/8] Configuring Authentication & Security...${NC}"
 
 # Initialize default Web UI credentials (admin / admin) if missing
 if [ ! -f "${CONFIG_DIR}/auth_config.json" ] && [ ! -f "/root/auth_config.json" ]; then
@@ -119,7 +114,6 @@ fi
 
 # Generate initial go2rtc streams config
 "${INSTALL_DIR}/venv/bin/python3" -c "import sys; sys.path.insert(0, '${INSTALL_DIR}/src'); import dvr_config; dvr_config.sync_go2rtc()" || true
-
 
 # Configure fail2ban
 cat << 'EOF' > /etc/fail2ban/jail.d/dvr-kiosk.local
@@ -154,9 +148,10 @@ echo "           ✓ DVR KIOSK SUCCESSFULLY INSTALLED!                  "
 echo "================================================================"
 echo -e "${NC}"
 echo -e "Access your WebUI at:"
-echo -e "  ${GREEN}https://${IP}:${NC} (Default port 443 / 80)"
+echo -e "  ${GREEN}http://${IP}/${NC} (Port 80)"
 echo ""
 echo -e "CLI Management:"
 echo -e "  Type ${YELLOW}dvr-kiosk${NC} anytime in your terminal for interactive menu"
 echo -e "  (Password changes, service restarts, DVR configurations)"
 echo "================================================================"
+

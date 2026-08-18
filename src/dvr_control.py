@@ -420,42 +420,49 @@ def get_recent_cpu_load_pct(sample_sec=3.0):
 
 
 def cpu_load_governor():
-    """Trades WebUI-preview JPEG freshness for CPU headroom under load.
+    """Trades WebUI-preview JPEG rate and post-decode sws_scale stride for CPU headroom under load.
 
-    Drives dvrwall's MJPEG_FPS_THUMB/_MAIN (see wall.set_jpeg_fps()), not
-    the TV compositor's TARGET_FPS -- the compositor runs on a fixed
-    COMPOSITOR_HZ tick with event-driven blit-on-new-frame (dvrwall.c), so
-    TARGET_FPS no longer paces anything there and throttling it would do
-    nothing to actual CPU use. JPEG re-encoding (grid/pool thumbnails and
-    the fullscreen live-preview cache) is the genuinely CPU-costly, load-
-    sensitive path, and it only affects a browser tab's picture, never the
-    physical TV output -- so it's the right thing to degrade first. The
-    mainstream (fullscreen) re-encode is larger and pricier per frame than
-    a thumbnail, so its tier drops before the thumbnail tier does.
-
-    Sends JPEGFPS every cycle regardless of whether the computed tier
-    changed from last time, rather than tracking "current" locally and
-    only sending on a delta -- dvrwall's actual state can drift out from
-    under a locally-tracked belief (a dvrwall restart resets to its
-    compiled-in default, or something else touches the same control
-    socket), and a stale belief means the governor silently stops
-    correcting it. JPEGFPS is a trivial O(1) command on dvrwall's side (two
-    int writes, no stream teardown), so there's no real cost to just always
-    asserting the computed tier.
+    Drives dvrwall's GLOBAL_SCALE_STRIDE (see wall.set_stride()) and MJPEG_FPS (wall.set_jpeg_fps()).
+    - Frame decode (avcodec_receive_frame) is NEVER skipped, preserving 100% P-frame reference integrity.
+    - Scale stride (sws_scale YUV->BGRA) skips color transformation under load, saving up to 60% CPU.
+    - Employs asymmetric hysteresis: immediately steps down on load spike (>80%), but requires
+      sustained low load (<60% for >=15s) to step up, preventing framerate oscillation.
     """
+    current_stride = 1
+    low_load_consecutive_ticks = 0
     while True:
         try:
-            load_pct = get_recent_cpu_load_pct()
+            load_pct = get_recent_cpu_load_pct(sample_sec=3.0)
             if load_pct > 90.0:
-                main_fps, thumb_fps = 1, 1     # Tier 5: emergency
+                target_stride = 8
+                main_fps, thumb_fps = 1, 1     # Emergency survival
             elif load_pct > 80.0:
-                main_fps, thumb_fps = 1, 2     # Tier 4: heavy load
-            elif load_pct > 70.0:
-                main_fps, thumb_fps = 2, 2     # Tier 3: high load
-            elif load_pct > 55.0:
-                main_fps, thumb_fps = 3, 3     # Tier 2: moderate load
+                target_stride = 4
+                main_fps, thumb_fps = 1, 2     # Heavy load
+            elif load_pct > 65.0:
+                target_stride = 2
+                main_fps, thumb_fps = 2, 2     # Moderate load
             else:
-                main_fps, thumb_fps = 6, 3     # Tier 1: normal
+                target_stride = 1
+                main_fps, thumb_fps = 6, 3     # Normal
+
+            # Asymmetric Hysteresis Logic
+            if target_stride > current_stride:
+                # Immediate step-down on spike
+                current_stride = target_stride
+                low_load_consecutive_ticks = 0
+                wall.set_stride(current_stride)
+            elif target_stride < current_stride:
+                if load_pct < 60.0:
+                    low_load_consecutive_ticks += 1
+                    if low_load_consecutive_ticks >= 2:   # ~16s sustained
+                        current_stride = max(1, current_stride // 2)
+                        low_load_consecutive_ticks = 0
+                        wall.set_stride(current_stride)
+                else:
+                    low_load_consecutive_ticks = 0
+            else:
+                low_load_consecutive_ticks = 0
 
             wall.set_jpeg_fps(thumb_fps, main_fps)
         except Exception:

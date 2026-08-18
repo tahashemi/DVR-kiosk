@@ -147,6 +147,8 @@ static void fb_blank(int on) {
  * the HTTP thumbnail server without touching the compositor at all.
  */
 
+static volatile int GLOBAL_SCALE_STRIDE = 1;
+
 struct stream {
     int used;
     uint64_t id;                /* monotonic, never reused for the life of the
@@ -173,6 +175,7 @@ struct stream {
     int have_frame;
     int64_t frame_ms;          /* when the newest frame landed */
     int64_t frames;            /* total decoded+scaled, for measuring real fps */
+    uint64_t decode_seq;        /* total raw frames decoded by avcodec_receive_frame */
     uint64_t seq;               /* bumped every time a new frame is published
                                   * (front/back swap). Lets the compositor blit
                                   * only on genuinely new frames instead of on
@@ -400,6 +403,13 @@ static void stream_session(struct stream *s) {
         if (r < 0 && r != AVERROR(EAGAIN)) continue;
 
         while (avcodec_receive_frame(dec, frame) == 0) {
+            s->decode_seq++;
+            int cur_stride = GLOBAL_SCALE_STRIDE;
+            if (cur_stride > 1 && (s->decode_seq % (unsigned)cur_stride) != 0) {
+                av_frame_unref(frame);
+                continue; /* Decode is intact (P-frame reference buffer maintained), but sws_scale is skipped! */
+            }
+
             if (!sws) {
                 sws = sws_getContext(dec->width, dec->height, dec->pix_fmt,
                                      sw, sh, AV_PIX_FMT_BGRA,
@@ -865,6 +875,14 @@ static void handle_cmd(int fd, char *line) {
         if (v) TARGET_FPS = atoi(v);
         dprintf(fd, "OK %d\n", TARGET_FPS);
 
+    } else if (strcmp(cmd, "STRIDE") == 0) {
+        char *v = strtok(NULL, " \t\r\n");
+        if (v) {
+            int sval = atoi(v);
+            if (sval >= 1 && sval <= 16) GLOBAL_SCALE_STRIDE = sval;
+        }
+        dprintf(fd, "OK %d\n", GLOBAL_SCALE_STRIDE);
+
     } else if (strcmp(cmd, "JPEGFPS") == 0) {
         /* Runtime WebUI-preview JPEG rate, independent of TARGET_FPS/the TV
          * compositor -- see MJPEG_FPS_THUMB/_MAIN's declaration comment. */
@@ -877,8 +895,8 @@ static void handle_cmd(int fd, char *line) {
     } else if (strcmp(cmd, "STATUS") == 0) {
         int64_t t = now_ms();
         pthread_mutex_lock(&ROSTER_LOCK);
-        dprintf(fd, "{\"blanked\":%d,\"fps\":%d,\"jpeg_fps_thumb\":%d,\"jpeg_fps_main\":%d,\"streams\":[",
-                BLANKED ? 1 : 0, TARGET_FPS, MJPEG_FPS_THUMB, MJPEG_FPS_MAIN);
+        dprintf(fd, "{\"blanked\":%d,\"fps\":%d,\"stride\":%d,\"jpeg_fps_thumb\":%d,\"jpeg_fps_main\":%d,\"streams\":[",
+                BLANKED ? 1 : 0, TARGET_FPS, GLOBAL_SCALE_STRIDE, MJPEG_FPS_THUMB, MJPEG_FPS_MAIN);
         int first = 1;
         for (int i = 0; i < MAX_STREAMS; i++) {
             struct stream *s = &STREAMS[i];

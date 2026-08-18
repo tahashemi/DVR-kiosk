@@ -142,7 +142,7 @@ flowchart TD
   - Verify renderKioskGrid() sets snapshot URLs and attaches event listeners.
   - Verify fullscreen() initiates 2-tier fallback without throwing JS errors.
 
-### Live Hardware & Network Verification (on Raspberry Pi 192.168.40.99):
+### Live Hardware & Network Verification (on Raspberry Pi 192.168.1.100):
 1. **Service Restart**: `systemctl restart dvr-kiosk.service dvrwall.service`
 2. **Kiosk Grid WebUI Check**: Load dashboard in browser, verify all 16 tiles render simultaneously with updating timestamps without blanks.
 3. **Pool Grid Check**: Verify all 28+ channels across DVR1, DVR2, and Tavakol display images and headers show `8/8 Online`, `4/4 Online`, etc.

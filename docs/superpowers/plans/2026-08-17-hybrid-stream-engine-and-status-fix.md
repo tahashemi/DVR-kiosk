@@ -10,7 +10,7 @@
 
 ## Global Constraints
 - Target Hardware: Raspberry Pi 4 / CM4 (ARM target).
-- Live Host: `192.168.40.99`.
+- Live Host: `192.168.1.100`.
 - Python Files: `DVR-KIOSK-GIT/src/dvr_control.py`, `DVR-KIOSK-GIT/src/wall.py`.
 - Git Tracking: `c:\Projects\DVR-kiosk\DVR-KIOSK-GIT`.
 
@@ -292,7 +292,7 @@ Ensure `threading.Thread(target=cpu_load_governor, daemon=True).start()` is spaw
 ### Task 5: Automated Verification, Pi Deployment, and Git Sync
 
 **Files:**
-- Deploy to: `/root/dvr_control.py` on Pi `192.168.40.99`
+- Deploy to: `/root/dvr_control.py` on Pi `192.168.1.100`
 - Sync to: `c:\Projects\DVR-kiosk\dvr_control.py`
 
 - [ ] **Step 1: Upload updated files to Raspberry Pi**
