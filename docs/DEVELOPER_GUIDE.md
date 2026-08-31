@@ -1,6 +1,14 @@
 # DVR Kiosk Developer & AI Agent Guide
 
-This document provides developer guidelines, code conventions, build procedures, and verification steps for contributors and AI agents working on the DVR Kiosk codebase.
+This document covers build procedures, code conventions, and verification
+steps. It is one of four:
+
+| Document | Purpose |
+| :--- | :--- |
+| [PROJECT.md](../PROJECT.md) | What this is, why it's built this way, hard-won facts |
+| [DEVELOPERS.md](../DEVELOPERS.md) | Deploy workflow, debugging techniques, open items |
+| [AGENTS.md](../AGENTS.md) | Rules and constraints for AI coding agents |
+| **This file** | Build commands, coding standards, verification |
 
 ---
 
@@ -78,7 +86,39 @@ git grep -iE "(password|secret|token)" | grep -v "auth_config"
 
 ---
 
+### 3.4 Power Schedule Verification
+
+The scheduler is easy to break in ways that are silent for hours, so test it
+explicitly after touching `stop_streams()`, `launch_grid()`,
+`apply_schedule_state()`, `sync_power_schedule()`, or `grid_watchdog()`:
+
+```bash
+# Back up first, then set a boundary ~2 minutes out
+cp /root/kiosk_schedule.json /root/kiosk_schedule.json.bak
+```
+
+Watch `STATUS` across both boundaries. The off transition must reach
+`streams=0` **and stay there** — if streams reappear, `grid_watchdog` is
+resurrecting them because `current_mode` was left stale (see
+[ARCHITECTURE.md](ARCHITECTURE.md) §4). Restore the real schedule afterwards.
+
+### 3.5 Optional Nightly Reboot
+
+Units ship installed but disabled, since reboot policy is a site decision:
+
+```bash
+sudo systemctl enable --now dvr-kiosk-reboot.timer
+systemctl list-timers dvr-kiosk-reboot.timer
+```
+
+Set `OnCalendar` to a time inside the display's off-window. Treat it as a
+safety net, not a fix — a nightly reboot masks stale-state bugs without
+addressing the resources they waste in between.
+
+---
+
 ## 4. Coding Standards & Behavioral Rules
 1. **Never Break Video Reference Chains**: Always decode all H.264/H.265 frames via `avcodec_receive_frame`. Only throttle post-decode processing (`sws_scale`).
-2. **Never Tear Down Sockets for Layout Switches**: Keep background substreams actively connected and adjust compositor pointers (`LAYOUT`, `FULLSCREEN`) to switch views in $<1\text{ms}$.
+2. **Never Tear Down Sockets for Layout Switches**: Keep background substreams actively connected and adjust compositor pointers (`LAYOUT`, `FULLSCREEN`) to switch views in $<1\text{ms}$. Use `DECODE` to pause decoding while staying connected.
 3. **Preserve Hysteresis**: Any CPU governor changes must preserve asymmetric recovery windows ($\ge 15$ seconds sustained low load before stepping up).
+4. **Move `current_mode` With the Wall**: Every function that starts or stops the wall must update `current_mode` itself, not rely on its callers. See [ARCHITECTURE.md](ARCHITECTURE.md) §4 — violating this is silent and self-sustaining.

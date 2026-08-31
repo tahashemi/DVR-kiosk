@@ -80,6 +80,7 @@ The system consists of three decoupled daemon processes communicating over local
 | Command | Arguments | Description |
 | :--- | :--- | :--- |
 | `CHANNELS` | `<url1> <url2> ...` | Set active background decoding roster. |
+| `DECODE` | `<url1> ...` (empty = all) | Decode only these streams; pause the rest. |
 | `LAYOUT` | `<url1> <url2> ...` | Set on-screen grid composite layout. |
 | `FULLSCREEN` | `<url>` | Switch display to 1x1 full-screen layout. |
 | `STRIDE` | `<1\|2\|4\|8>` | Set post-decode scale-skip stride. |
@@ -89,3 +90,62 @@ The system consists of three decoupled daemon processes communicating over local
 | `CLEAR` | None | Blank TV display while keeping decoders warm. |
 | `STOP` | None | Stop all decoder streams. |
 | `BLANK` | None | Stop decoders and power down display (`FB_BLANK_POWERDOWN`). |
+
+---
+
+## 4. Wall State Machine & Power Schedule
+
+`dvr_control.py` holds a single module-level `current_mode` that is the
+authoritative record of what the wall is doing:
+
+| Value | Meaning |
+| :--- | :--- |
+| `"stopped"` | No decoders connected, display blanked. |
+| `"grid"` | Multi-tile composite on screen. |
+| `"fullscreen"` | Single channel on screen (mainstream). |
+
+### The invariant
+
+> **Every code path that starts or stops the wall must move `current_mode`
+> with it, in the same function that performs the action.**
+
+This is not cosmetic bookkeeping — two subsystems make decisions from it:
+
+1. `grid_watchdog()` re-asserts the decode roster on a timer whenever the mode
+   is `"grid"`. If a stop leaves the mode stale, the watchdog reconnects every
+   stream within seconds and silently undoes the shutdown. The wall then burns
+   full decode CPU behind a blanked screen.
+2. `apply_schedule_state()` decides whether a scheduled transition is needed by
+   comparing against the mode. A stale mode makes the scheduled turn-on a
+   silent no-op, leaving the display black for the entire window.
+
+Both failures are silent and self-sustaining: nothing errors, nothing logs, and
+the state cannot recover on its own. Ownership therefore lives in
+`stop_streams()` / `launch_grid()` / `launch_fullscreen()` rather than in their
+callers, so a new caller cannot forget it.
+
+### Scheduling behaviour
+
+- `sync_power_schedule()` polls every 10s and acts **on boundary crossings
+  only**, not continuously. That is deliberate: a manual on/off from the
+  dashboard is honoured for the remainder of the window instead of being
+  reverted on the next poll.
+- Immediately after a boundary there is a short confirmation window
+  (`SCHEDULE_CONFIRM_SEC`) during which a transition that did not take effect
+  is retried — this recovers a transition lost to a restarting compositor or a
+  transient control-socket failure.
+- Any manual dashboard action calls `cancel_schedule_confirm()`, so that retry
+  can never fight a deliberate override.
+- Both transitions log to stdout, so a wall in an unexpected state can be
+  diagnosed from the service log rather than by inference.
+
+### Optional nightly reboot
+
+`systemd/dvr-kiosk-reboot.{timer,service}` are installed but **not enabled** —
+whether an appliance reboots on a schedule is a site policy decision. Enable
+with `systemctl enable --now dvr-kiosk-reboot.timer`, and set `OnCalendar` to a
+time inside the display's off-window so nothing is on screen when it happens.
+
+Treat it as a safety net, not a correctness mechanism. A nightly reboot masks
+stale-state bugs (a fresh process starts at `"stopped"`) without fixing the
+wasted resources they cause in between.

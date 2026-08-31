@@ -24,6 +24,8 @@ Combines an ultra-efficient C-based HDMI video wall compositor (`dvrwall`) with 
   - `fail2ban` brute-force protection with 24-hour ban.
   - Salted password authentication with cryptographically secure session tokens.
   - Zero-credential git architecture.
+- 🕗 **Operating-Hours Power Schedule**: Configurable daily on/off window that drops every decoder connection when the wall is off, so an idle wall costs essentially no CPU. Manual on/off from the dashboard is honoured until the next boundary.
+- 🔁 **Optional Nightly Reboot**: Systemd timer shipped installed-but-disabled (`systemctl enable --now dvr-kiosk-reboot.timer`), with a configurable `OnCalendar`.
 - ⌨️ **Interactive CLI Tool (`dvr-kiosk`)**: Built-in terminal dashboard for password changes, service restarts, and configuration management.
 
 ---
@@ -81,7 +83,15 @@ $ sudo dvr-kiosk
 
 ## 📚 Documentation
 
-- 🏛️ **[System Architecture](docs/ARCHITECTURE.md)**: Compositor internals, UNIX socket IPC protocol, and stream pipeline.
+**Start here if you're new to the project:**
+
+- 🧭 **[PROJECT.md](PROJECT.md)**: What this is, why it's designed this way, and the hard-won facts worth not rediscovering.
+
+**Then, depending on what you're doing:**
+
+- 🏛️ **[System Architecture](docs/ARCHITECTURE.md)**: Compositor internals, UNIX socket IPC protocol, stream pipeline, and the wall state machine.
+- 🔧 **[DEVELOPERS.md](DEVELOPERS.md)**: Deploy workflow, debugging techniques that actually work on this hardware, and open items.
+- 🤖 **[AGENTS.md](AGENTS.md)**: Constraints and working rules for AI coding agents.
 - 🛡️ **[Security & Hardening](docs/SECURITY.md)**: Reverse proxy TLS termination, fail2ban, session token auth, and credential isolation.
 - 👩‍💻 **[Developer & Agent Guide](docs/DEVELOPER_GUIDE.md)**: Local compilation, testing workflows, socket commands, and coding standards.
 
