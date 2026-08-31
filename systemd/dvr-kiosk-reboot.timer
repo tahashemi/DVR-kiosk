@@ -1,0 +1,20 @@
+[Unit]
+Description=DVR Kiosk scheduled nightly reboot
+Documentation=https://github.com/tahashemi/DVR-kiosk
+
+[Timer]
+# Change this line to move the reboot. Pick a time inside the display's
+# scheduled off-window so nothing is on screen when the box goes down.
+OnCalendar=*-*-* 02:00:00
+
+# No Persistent=true on purpose: if the machine was off at 02:00 there is
+# nothing to catch up on, and a missed-reboot replay would fire one during
+# viewing hours -- exactly when a reboot is least wanted.
+Persistent=false
+
+# Spread load if several units share this time; also avoids every device in a
+# fleet rebooting on the same second.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

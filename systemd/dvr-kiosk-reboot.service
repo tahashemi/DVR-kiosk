@@ -1,0 +1,7 @@
+[Unit]
+Description=DVR Kiosk scheduled nightly reboot
+Documentation=https://github.com/tahashemi/DVR-kiosk
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl reboot

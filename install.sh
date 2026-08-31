@@ -136,6 +136,14 @@ cp "${INSTALL_DIR}/systemd/go2rtc.service" /etc/systemd/system/
 cp "${INSTALL_DIR}/systemd/dvrwall.service" /etc/systemd/system/
 cp "${INSTALL_DIR}/systemd/dvr-kiosk.service" /etc/systemd/system/
 
+# Nightly reboot units are installed but NOT enabled: whether an appliance
+# reboots on a schedule is a site policy decision, not a requirement of the
+# software. Enable with:
+#     sudo systemctl enable --now dvr-kiosk-reboot.timer
+# Edit OnCalendar in the .timer first if 02:00 clashes with your viewing hours.
+cp "${INSTALL_DIR}/systemd/dvr-kiosk-reboot.service" /etc/systemd/system/
+cp "${INSTALL_DIR}/systemd/dvr-kiosk-reboot.timer" /etc/systemd/system/
+
 systemctl daemon-reload
 systemctl enable go2rtc.service dvrwall.service dvr-kiosk.service
 systemctl restart go2rtc.service dvrwall.service dvr-kiosk.service
@@ -153,5 +161,10 @@ echo ""
 echo -e "CLI Management:"
 echo -e "  Type ${YELLOW}dvr-kiosk${NC} anytime in your terminal for interactive menu"
 echo -e "  (Password changes, service restarts, DVR configurations)"
+echo ""
+echo -e "Optional nightly reboot (installed, not enabled):"
+echo -e "  ${YELLOW}sudo systemctl enable --now dvr-kiosk-reboot.timer${NC}"
+echo -e "  Defaults to 02:00 - edit OnCalendar in"
+echo -e "  /etc/systemd/system/dvr-kiosk-reboot.timer to change it."
 echo "================================================================"
 

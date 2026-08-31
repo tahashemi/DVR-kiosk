@@ -31,6 +31,19 @@ fullscreen_target = None
 wall_status_cache = None
 scheduler_last_state = None
 
+# Short window after a scheduled transition during which sync_power_schedule()
+# will retry if the transition didn't actually take. Any manual dashboard
+# action clears it (see cancel_schedule_confirm()), so the retry can never
+# fight a deliberate override -- it only recovers a genuinely failed switch.
+SCHEDULE_CONFIRM_SEC = 30
+_schedule_confirm_until = 0.0
+
+
+def cancel_schedule_confirm():
+    """Stop the scheduler retrying its last transition (a human took over)."""
+    global _schedule_confirm_until
+    _schedule_confirm_until = 0.0
+
 # ---- Security & Authentication State ----
 SESSION_COOKIE_NAME = "dvr_session"
 SESSION_DURATION_SEC = 30 * 24 * 3600  # 30 days
@@ -137,7 +150,20 @@ def get_all_active_channels():
 
 
 def stop_streams():
-    """Dashboard 'Turn Off Kiosk': full teardown."""
+    """Full teardown: drop every decoder connection and blank the wall.
+
+    Sets current_mode itself rather than leaving that to callers. Every path
+    that starts or stops the wall must move current_mode with it, because
+    grid_watchdog() re-asserts the decode roster on a timer whenever the mode
+    says "grid". A stop that left the mode stale therefore got silently
+    undone: the watchdog reconnected all substreams within seconds and they
+    decoded all night behind a blanked screen, and the scheduled turn-on --
+    which only fires when the mode is "stopped" -- then never ran, so the
+    wall stayed black until someone intervened by hand.
+    """
+    global current_mode, fullscreen_target
+    current_mode = "stopped"
+    fullscreen_target = None
     try:
         wall.stop()
     except wall.WallError as e:
@@ -368,16 +394,41 @@ def stream_health():
 
 
 def apply_schedule_state(should_be_on):
+    """Drive the wall to the state the schedule wants.
+
+    Asserts the desired state rather than trusting one exact sentinel value.
+    The previous version only turned the wall on `if current_mode ==
+    "stopped"`, so any unexpected mode meant the scheduled turn-on silently
+    did nothing -- and "silently does nothing" is how a black screen survives
+    a full 12-hour window. Both branches are cheap no-ops when the wall is
+    already in the right state, so it is safe to call repeatedly.
+    """
     if should_be_on:
-        if current_mode == "stopped":
+        # "on" is satisfied by either grid or fullscreen -- don't yank a user
+        # out of a fullscreen channel just because the scheduler expected grid.
+        if current_mode not in ("grid", "fullscreen"):
+            print(f"schedule: turning wall ON (was {current_mode})", flush=True)
             launch_grid()
     else:
-        stop_streams()
+        if current_mode != "stopped":
+            print(f"schedule: turning wall OFF (was {current_mode})", flush=True)
+            stop_streams()
 
 
 def sync_power_schedule():
-    """Background loop enforcing the schedule config."""
-    global scheduler_last_state
+    """Background loop enforcing the schedule config.
+
+    Acts on boundary crossings only, not continuously -- that is deliberate,
+    so a manual on/off from the dashboard is honoured for the rest of the
+    window instead of being stamped back a few seconds later.
+
+    The one exception is a short confirmation window right after a boundary:
+    if the transition didn't actually take (dvrwall restarting, a transient
+    control-socket failure), retry for a few polls. That recovers a failed
+    transition without fighting a deliberate manual override made later in
+    the window, which a blanket re-assert would do.
+    """
+    global scheduler_last_state, _schedule_confirm_until
     while True:
         try:
             cfg = schedule.get()
@@ -386,8 +437,20 @@ def sync_power_schedule():
                 if scheduler_last_state is None or scheduler_last_state != should_be_on:
                     apply_schedule_state(should_be_on)
                     scheduler_last_state = should_be_on
+                    _schedule_confirm_until = time.time() + SCHEDULE_CONFIRM_SEC
+                elif time.time() < _schedule_confirm_until:
+                    settled = (current_mode in ("grid", "fullscreen")) if should_be_on \
+                        else (current_mode == "stopped")
+                    if not settled:
+                        print(
+                            f"schedule: transition did not take (mode={current_mode}, "
+                            f"want={'on' if should_be_on else 'off'}), retrying",
+                            flush=True,
+                        )
+                        apply_schedule_state(should_be_on)
             else:
                 scheduler_last_state = None
+                _schedule_confirm_until = 0.0
         except Exception as e:
             print(f"sync_power_schedule error: {e}", flush=True)
         time.sleep(10)
@@ -2220,6 +2283,7 @@ def api_profile_activate(key):
 @app.route('/api/kiosk/grid', methods=['POST'])
 @require_auth
 def api_kiosk_grid():
+    cancel_schedule_confirm()
     threading.Thread(target=launch_grid).start()
     return jsonify({"ok": True})
 
@@ -2230,6 +2294,7 @@ def api_kiosk_fullscreen():
     body = request.get_json(force=True)
     dvr = body.get("dvr")
     ch = int(body.get("ch", 1))
+    cancel_schedule_confirm()
     threading.Thread(target=launch_fullscreen, args=(dvr, ch), daemon=True).start()
     return jsonify({"ok": True})
 
@@ -2237,9 +2302,15 @@ def api_kiosk_fullscreen():
 @app.route('/api/kiosk/stop', methods=['POST'])
 @require_auth
 def api_kiosk_stop():
-    global current_mode, fullscreen_target
-    current_mode = "stopped"
-    fullscreen_target = None
+    # stop_streams() owns the current_mode / fullscreen_target transition now,
+    # so this endpoint no longer sets them itself -- one place to get right.
+    #
+    # Deliberately does NOT touch scheduler_last_state: that tracks the last
+    # state the *schedule* asked for, and leaving it alone is exactly what
+    # makes a manual stop stick for the rest of the window (the scheduler
+    # sees no boundary crossing, so it takes no action). Setting it here
+    # would invert that and make the scheduler immediately undo the stop.
+    cancel_schedule_confirm()
     stop_streams()
     return jsonify({"ok": True})
 
