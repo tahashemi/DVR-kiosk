@@ -29,3 +29,6 @@ Thumbs.db
 .idea/
 .claude/
 .antigravity/
+
+# Knowledge graph output (generated)
+graphify-out/
