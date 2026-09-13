@@ -17,6 +17,7 @@ import profiles
 import schedule
 import wall
 import set_password
+from wall_page import WALL_HTML
 
 app = Flask(__name__)
 
@@ -30,6 +31,13 @@ active_channels_cache = []
 fullscreen_target = None
 wall_status_cache = None
 scheduler_last_state = None
+
+# Published by cpu_load_governor() so HTTP handlers and the /wall page can pace
+# themselves to whatever the board can currently afford. dvrwall is already
+# told the same number via JPEGFPS; mirroring it here means the browser asks
+# for frames at the rate that actually exist instead of hammering for frames
+# the encoder is not producing.
+governor_thumb_fps = 3
 
 # Short window after a scheduled transition during which sync_power_schedule()
 # will retry if the transition didn't actually take. Any manual dashboard
@@ -527,6 +535,8 @@ def cpu_load_governor():
             else:
                 low_load_consecutive_ticks = 0
 
+            global governor_thumb_fps
+            governor_thumb_fps = thumb_fps
             wall.set_jpeg_fps(thumb_fps, main_fps)
         except Exception:
             pass
@@ -879,6 +889,7 @@ HTML = """<!DOCTYPE html>
   </header>
 
   <div id="hdrMenu">
+    <div id="hmOpenWall">🖥️ Open video wall</div>
     <div id="hmNewProfile">New profile</div>
     <div id="hmRenameProfile">Rename profile</div>
     <div id="hmDeleteProfile" class="danger-item">Delete profile</div>
@@ -1489,6 +1500,9 @@ function showHdrMenu() {
   menu.style.top = (r.bottom + 4) + 'px';
   menu.style.display = 'block';
 }
+document.getElementById('hmOpenWall').addEventListener('click', () => {
+  window.open('/wall', '_blank');
+});
 document.getElementById('btnHdrMenu').addEventListener('click', (e) => {
   e.stopPropagation();
   showHdrMenu();
@@ -1917,6 +1931,13 @@ def home():
     return render_template_string(HTML, authenticated=bool(user), user=user)
 
 
+@app.route('/wall')
+@require_auth
+def wall_view():
+    """Chrome-free browser mirror of the TV wall (see wall_page.py)."""
+    return render_template_string(WALL_HTML)
+
+
 # ---- Multi-DVR Management Endpoints ----
 
 @app.route('/api/dvr/list')
@@ -2026,7 +2047,20 @@ def api_channel_labels_post():
 
 _SNAPSHOT_CACHE = {}
 _CACHE_LOCK = threading.Lock()
-SNAPSHOT_TTL_SEC = 2.0
+SNAPSHOT_TTL_SEC = 2.0        # upper bound, used when the governor is throttling hard
+
+
+def snapshot_ttl():
+    """How long a cached JPEG stays fresh, tied to the rate dvrwall is encoding at.
+
+    Caching a frame for longer than one encoder frame period only serves stale
+    pixels; caching for less just re-fetches the identical frame. So the TTL is
+    one frame period, clamped. Under load the governor lowers thumb fps and this
+    lengthens with it, which is what keeps a wall of tiles from multiplying the
+    request rate exactly when the board can least afford it.
+    """
+    fps = max(1, int(governor_thumb_fps or 1))
+    return min(SNAPSHOT_TTL_SEC, max(0.3, 1.0 / fps))
 
 
 @app.route('/api/snapshot/<dvr_key>/<int:ch>')
@@ -2046,7 +2080,7 @@ def api_snapshot(dvr_key, ch):
     now = time.time()
     with _CACHE_LOCK:
         cached = _SNAPSHOT_CACHE.get(key)
-        if cached and (now - cached[1] < SNAPSHOT_TTL_SEC):
+        if cached and (now - cached[1] < snapshot_ttl()):
             return Response(cached[0], mimetype="image/jpeg")
 
     name = dvr_config.stream_name(dvr_key, ch, mainstream=False)
@@ -2323,6 +2357,42 @@ def api_kiosk_status():
         "fullscreen": fullscreen_target,
         "health": stream_health(),
         "wall": wall_status_cache is not None,
+        "thumb_fps": governor_thumb_fps,
+    })
+
+
+@app.route('/api/wall/layout')
+@require_auth
+def api_wall_layout():
+    """Everything /wall needs in one request: what the TV is showing, in its order.
+
+    Deliberately mirrors the kiosk rather than re-deriving a layout, so the
+    browser view cannot drift from the physical wall. When the TV is in
+    fullscreen the page follows it into fullscreen on the same channel.
+    """
+    try:
+        chans = profiles.get_active_channels()
+    except Exception:
+        chans = get_all_active_channels()
+
+    health = stream_health()
+    tiles = []
+    for c in chans:
+        dvr_key, ch = c.get("dvr"), c.get("ch")
+        key = f"{dvr_key}/{ch}"
+        st = health.get(key, {})
+        tiles.append({
+            "dvr": dvr_key,
+            "ch": ch,
+            "label": channel_labels.get_label(dvr_key, ch),
+            "online": bool(st.get("have_frame")),
+        })
+
+    return jsonify({
+        "mode": current_mode,
+        "fullscreen": fullscreen_target,
+        "thumb_fps": governor_thumb_fps,
+        "tiles": tiles,
     })
 
 

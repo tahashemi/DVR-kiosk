@@ -26,6 +26,7 @@ Combines an ultra-efficient C-based HDMI video wall compositor (`dvrwall`) with 
   - Zero-credential git architecture.
 - 🕗 **Operating-Hours Power Schedule**: Configurable daily on/off window that drops every decoder connection when the wall is off, so an idle wall costs essentially no CPU. Manual on/off from the dashboard is honoured until the next boundary.
 - 🔁 **Optional Nightly Reboot**: Systemd timer shipped installed-but-disabled (`systemctl enable --now dvr-kiosk-reboot.timer`), with a configurable `OnCalendar`.
+- 🖥️ **Browser Video Wall (`/wall`)**: Chrome-free page that mirrors the TV exactly — same profile order, and it follows the kiosk into fullscreen. Landscape renders the full grid edge to edge; portrait paginates into swipeable pages so tiles stay readable on a phone. Frames are polled `<img>` rather than MJPEG (16 MJPEG streams would occupy the entire web-server thread pool), each tile chains its next request off the previous one so requests never queue, offscreen tiles stop polling entirely, and the poll rate follows the CPU governor's current tier.
 - ⌨️ **Interactive CLI Tool (`dvr-kiosk`)**: Built-in terminal dashboard for password changes, service restarts, and configuration management.
 
 ---

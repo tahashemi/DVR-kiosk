@@ -86,7 +86,23 @@ git grep -iE "(password|secret|token)" | grep -v "auth_config"
 
 ---
 
-### 3.4 Power Schedule Verification
+### 3.4 Browser Wall (`/wall`) Verification
+
+The page is cheap only while its guards hold, and all three fail silently:
+
+```bash
+# 1. Request rate should equal (visible tiles x governor thumb fps), no more.
+#    Watch the access log while the page is open.
+# 2. Background the tab -- the rate must fall to zero, not merely drop.
+# 3. In portrait, swipe between pages -- the tile count polling must stay at
+#    one page's worth, never the sum of both.
+```
+
+A tile that shows its label placeholder forever while requests are flowing
+means frames are arriving but never being swapped in — check that the
+double-buffered `Image` swap is intact rather than a direct `src` assignment.
+
+### 3.5 Power Schedule Verification
 
 The scheduler is easy to break in ways that are silent for hours, so test it
 explicitly after touching `stop_streams()`, `launch_grid()`,
@@ -102,7 +118,7 @@ Watch `STATUS` across both boundaries. The off transition must reach
 resurrecting them because `current_mode` was left stale (see
 [ARCHITECTURE.md](ARCHITECTURE.md) §4). Restore the real schedule afterwards.
 
-### 3.5 Optional Nightly Reboot
+### 3.6 Optional Nightly Reboot
 
 Units ship installed but disabled, since reboot policy is a site decision:
 
@@ -121,4 +137,5 @@ addressing the resources they waste in between.
 1. **Never Break Video Reference Chains**: Always decode all H.264/H.265 frames via `avcodec_receive_frame`. Only throttle post-decode processing (`sws_scale`).
 2. **Never Tear Down Sockets for Layout Switches**: Keep background substreams actively connected and adjust compositor pointers (`LAYOUT`, `FULLSCREEN`) to switch views in $<1\text{ms}$. Use `DECODE` to pause decoding while staying connected.
 3. **Preserve Hysteresis**: Any CPU governor changes must preserve asymmetric recovery windows ($\ge 15$ seconds sustained low load before stepping up).
-4. **Move `current_mode` With the Wall**: Every function that starts or stops the wall must update `current_mode` itself, not rely on its callers. See [ARCHITECTURE.md](ARCHITECTURE.md) §4 — violating this is silent and self-sustaining.
+4. **Never Open 16 Long-Lived Connections From One Page**: The WSGI server runs a fixed worker pool (`threads=16`). A browser view that opens one MJPEG stream per tile holds a worker each for the life of the page and starves every other client. Tile views poll `<img>` instead, and chain each request off the previous one's completion so requests cannot queue. See [ARCHITECTURE.md](ARCHITECTURE.md) §3b.
+5. **Move `current_mode` With the Wall**: Every function that starts or stops the wall must update `current_mode` itself, not rely on its callers. See [ARCHITECTURE.md](ARCHITECTURE.md) §4 — violating this is silent and self-sustaining.

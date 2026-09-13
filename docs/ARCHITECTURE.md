@@ -93,6 +93,30 @@ The system consists of three decoupled daemon processes communicating over local
 
 ---
 
+## 3b. Browser Wall (`/wall`)
+
+`/wall` renders the same thing the TV shows, in a browser. It holds no state of
+its own: `/api/wall/layout` returns the active profile's channels in order plus
+the kiosk's current mode, and the page rebuilds only when that payload changes.
+Following the kiosk rather than re-deriving a layout is what keeps the browser
+view from drifting away from the physical wall.
+
+Frame delivery is the part worth understanding, because the obvious
+implementation does not survive this hardware:
+
+| Choice | Reason |
+| :--- | :--- |
+| Polled `<img>`, not MJPEG | A 16-tile MJPEG view holds 16 connections open for the life of the page. The WSGI server runs a fixed worker pool of the same order, so one such viewer starves every other client, dashboard included. |
+| Double-buffered swap | The frame loads into a detached `Image` and is swapped in only once decoded. Assigning `src` directly blanks the element until the new frame arrives, which at these rates leaves every tile permanently mid-load and painting nothing. |
+| Next request issued on completion | Each tile schedules its next fetch from the previous fetch's handler, never from a free-running timer, so a slow board lowers the frame rate instead of accumulating in-flight requests. Same latest-frame-wins rule the compositor uses. |
+| Offscreen tiles stop entirely | Tiles on a non-visible portrait page, and every tile while the tab is hidden, drop their `src` and cancel their timer. A backgrounded phone costs the board nothing. |
+| Rate follows the governor | The poll period comes from the governor's published thumbnail fps, so the browser backs off in step with the encoder instead of demanding frames that are not being produced. |
+| Failing channels back off | A channel that errors repeatedly is retried on a widening delay, so an unreachable DVR does not cost as much as a working one. |
+
+The snapshot cache TTL is derived from the same governor tier: caching a frame
+for longer than one encoder frame period only serves stale pixels, and caching
+for less just re-fetches an identical frame.
+
 ## 4. Wall State Machine & Power Schedule
 
 `dvr_control.py` holds a single module-level `current_mode` that is the
