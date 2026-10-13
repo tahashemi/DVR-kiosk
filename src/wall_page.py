@@ -132,6 +132,7 @@ WALL_HTML = r"""<!DOCTYPE html>
     background: #000; color: #7d8592; padding: 24px; font-size: 14px;
   }
   #msg.on { display: flex; }
+  {% raw %}/*PTZ_CSS*/{% endraw %}
 </style>
 </head>
 <body>
@@ -151,6 +152,7 @@ WALL_HTML = r"""<!DOCTYPE html>
 
 <script>
 "use strict";
+{% raw %}/*PTZ_JS*/{% endraw %}
 
 var PAGES = document.getElementById('pages');
 var DOTS  = document.getElementById('dots');
@@ -265,6 +267,12 @@ function makeTile(spec, page, isSolo) {
   cap.textContent = spec.label;
 
   el.appendChild(img); el.appendChild(ph); el.appendChild(cap);
+  if (spec.ptz && !isSolo) {
+    var badge = document.createElement('div');
+    badge.className = 'ptz-badge';
+    badge.textContent = 'PTZ';
+    el.appendChild(badge);
+  }
 
   var t = {
     dvr: spec.dvr, ch: spec.ch, label: spec.label,
@@ -275,6 +283,7 @@ function makeTile(spec, page, isSolo) {
 }
 
 function build(data) {
+  PTZ.detach();
   for (var i = 0; i < tiles.length; i++) if (tiles[i].timer) clearTimeout(tiles[i].timer);
   tiles = [];
   PAGES.innerHTML = '';
@@ -290,7 +299,7 @@ function build(data) {
     for (var j = 0; j < list.length; j++) {
       if (list[j].dvr === fs.dvr && list[j].ch === fs.ch) { solo = list[j]; break; }
     }
-    if (!solo) solo = { dvr: fs.dvr, ch: fs.ch, label: fs.dvr + ' CH' + fs.ch, online: true };
+    if (!solo) solo = { dvr: fs.dvr, ch: fs.ch, label: fs.label || (fs.dvr + ' CH' + fs.ch), online: true, ptz: !!fs.ptz };
   }
   document.body.classList.toggle('solo', !!solo);
 
@@ -313,6 +322,8 @@ function build(data) {
     PAGES.appendChild(page);
     document.body.classList.remove('multipage');
     updateVisibility();
+    /* The TV is showing one PTZ camera: this view becomes its remote control. */
+    if (solo.ptz) PTZ.attach(st.el, solo.dvr);
     return;
   }
 
@@ -368,7 +379,7 @@ async function sync() {
     var next = JSON.stringify([
       d.mode,
       d.fullscreen,
-      (d.tiles || []).map(function (t) { return t.dvr + '/' + t.ch + '/' + t.label; })
+      (d.tiles || []).map(function (t) { return t.dvr + '/' + t.ch + '/' + t.label + (t.ptz ? '/ptz' : ''); })
     ]);
     if (next !== sig) { sig = next; build(d); }
   } catch (e) { /* transient -- the next tick retries */ }
@@ -405,7 +416,11 @@ function toggleFs() {
 document.getElementById('btnFs').addEventListener('click', function (e) {
   e.stopPropagation(); toggleFs(); wake();
 });
-document.addEventListener('dblclick', toggleFs);
+document.addEventListener('dblclick', function (e) {
+  /* Double-tapping PTZ buttons must not flip browser fullscreen. */
+  if (e.target.closest && e.target.closest('.ptz-ui')) return;
+  toggleFs();
+});
 document.addEventListener('keydown', function (e) {
   if (e.key === 'f' || e.key === 'F') toggleFs();
   if (e.key === 'l' || e.key === 'L') document.body.classList.toggle('show-labels');
@@ -437,3 +452,7 @@ setInterval(sync, 5000);
 </body>
 </html>
 """
+
+from ptz_ui import PTZ_CSS, PTZ_JS  # noqa: E402  (spliced in; see ptz_ui.py)
+
+WALL_HTML = WALL_HTML.replace("/*PTZ_CSS*/", PTZ_CSS).replace("/*PTZ_JS*/", PTZ_JS)

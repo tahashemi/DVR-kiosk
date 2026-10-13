@@ -63,6 +63,8 @@ The system consists of three decoupled daemon processes communicating over local
 ### 2.2 `go2rtc` Stream Gateway
 - Handles camera manufacturer protocols (DVRIP, Hikvision, Dahua, RTSP).
 - Serves low-latency RTSP feeds locally on `rtsp://127.0.0.1:8554/` for `dvrwall`.
+- **Source types** (`type` in `dvr_config.json`, default `dvrip`): a multi-channel DVR (`dvrip://`), a single RTSP camera (the URL as given, optional separate `url_main`), or a single ONVIF camera (`onvif://`, go2rtc resolves the stream). Single cameras are stored as one-channel entries, so everything downstream — `dvrwall`, profiles, labels, `/wall` — keeps addressing `<key>_ch1` with no special cases. Credentials are percent-encoded into URLs and every YAML value is quoted, so user input can't break or inject into `go2rtc.yaml`.
+- **PTZ** (ONVIF only, `onvif_util.py`, standard library SOAP): moves are `ContinuousMove` velocities that the browser renews ~1/s while held; a server-side timer sends `Stop` if renewals stop (1.5 s), and the UI sends at most 4 moves/s, latest-wins.
 
 ### 2.3 `dvr_control.py` & CPU Load Governor
 - **Dynamic CPU Load Governor**:

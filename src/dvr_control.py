@@ -1,11 +1,15 @@
+import base64
 import functools
+import hashlib
 import json
 import os
 import secrets
 import socket
 import ssl
 import threading
+import re
 import time
+import urllib.parse
 import urllib.request
 
 from flask import Flask, jsonify, render_template_string, request, Response, make_response
@@ -17,6 +21,8 @@ import profiles
 import schedule
 import wall
 import set_password
+import onvif_util
+from ptz_ui import PTZ_CSS, PTZ_JS
 from wall_page import WALL_HTML
 
 app = Flask(__name__)
@@ -821,6 +827,25 @@ HTML = """<!DOCTYPE html>
     .kiosk-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
     .pool-channels { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
   }
+  .src-tabs { display:flex; gap:4px; background:var(--bg-2, rgba(255,255,255,.04)); padding:4px; border-radius:10px; }
+  .src-tabs button { flex:1; border:0; background:transparent; color:var(--text-dim); padding:8px 6px; border-radius:7px; font-weight:600; font-size:12px; cursor:pointer; }
+  .src-tabs button.on { background:var(--accent); color:#fff; }
+  .src-pane { display:none; flex-direction:column; gap:8px; }
+  .src-pane.on { display:flex; }
+  .src-hint { font-size:11px; color:var(--text-dim); margin:0; line-height:1.5; }
+  .src-hint code { font-size:11px; }
+  .src-msg { font-size:12px; min-height:16px; margin:0; }
+  .src-msg.err { color:#f87171; } .src-msg.ok { color:#4ade80; }
+  .src-preview { display:none; width:100%; border-radius:8px; aspect-ratio:16/9; object-fit:cover; background:#000; }
+  .src-actions { display:flex; gap:8px; }
+  .src-actions button { flex:1; }
+  .scan-list { display:flex; flex-direction:column; gap:6px; max-height:180px; overflow-y:auto; }
+  .scan-item { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; cursor:pointer; font-size:12px; }
+  .scan-item:hover { border-color:var(--accent); }
+  .scan-item small { color:var(--text-dim); }
+  .type-badge { display:inline-block; font-size:9px; font-weight:700; letter-spacing:.05em; padding:1px 5px; border-radius:4px; margin-left:6px; vertical-align:middle; background:rgba(255,255,255,.1); color:var(--text-dim); }
+  .type-badge.ptz { background:rgba(59,130,246,.25); color:#93c5fd; }
+  {% raw %}/*PTZ_CSS*/{% endraw %}
 </style>
 </head>
 <body>
@@ -899,7 +924,7 @@ HTML = """<!DOCTYPE html>
 
   <!-- Synchronized Web Fullscreen Overlay (Shared Hardware Decode & Live Stream) -->
   <div id="webFullscreenOverlay" class="modal-overlay" style="display:none; padding:0; background:#000; z-index:4000; width:100vw; height:100vh; position:fixed; top:0; left:0; right:0; bottom:0;">
-    <div style="position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; background:#000; overflow:hidden;">
+    <div id="webFsStage" style="position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; background:#000; overflow:hidden;">
       <div style="position:absolute; top:12px; left:16px; right:16px; display:flex; align-items:center; justify-content:space-between; z-index:50; pointer-events:none;">
         <span id="webFsTitle" style="font-size:15px; font-weight:700; color:#fff; font-family:var(--font-head); text-shadow:0 2px 4px rgba(0,0,0,0.9); background:rgba(0,0,0,0.65); padding:6px 14px; border-radius:8px; backdrop-filter:blur(4px);"></span>
         <button id="btnCloseWebFs" class="ghost icon" style="font-size:24px; color:#fff; width:44px; height:44px; background:rgba(0,0,0,0.7); border-radius:50%; border:1px solid rgba(255,255,255,0.3); backdrop-filter:blur(8px); pointer-events:auto; cursor:pointer;">✕</button>
@@ -924,17 +949,56 @@ HTML = """<!DOCTYPE html>
           <div id="dvrManagerList"></div>
           
           <div style="margin-top:12px; border-top:1px solid var(--line); padding-top:10px;">
-            <button id="btnShowAddDvr" class="ghost" style="width:100%; font-size:12px; border:1px dashed var(--line-bright);">➕ Add New DVR</button>
-            <div id="addDvrForm" style="display:none; flex-direction:column; gap:8px; margin-top:10px;">
-              <input type="text" id="addDvrKey" placeholder="Identifier key (e.g. dvr3)" class="search-input">
-              <input type="text" id="addDvrLabel" placeholder="Display Name (e.g. Warehouse WAN)" class="search-input">
-              <div style="display:flex; gap:8px;">
-                <input type="text" id="addDvrIp" placeholder="IP / Hostname" class="search-input" style="flex:2;">
-                <input type="number" id="addDvrPort" placeholder="Port (3456)" class="search-input" value="3456" style="flex:1;">
-                <input type="number" id="addDvrChs" placeholder="Channels (8)" class="search-input" value="8" style="flex:1;">
+            <button id="btnShowAddDvr" class="ghost" style="width:100%; font-size:12px; border:1px dashed var(--line-bright);">➕ Add DVR or Camera</button>
+            <div id="addDvrForm" style="display:none; flex-direction:column; gap:10px; margin-top:10px;">
+              <div class="src-tabs" role="tablist">
+                <button data-src="dvrip" class="on">DVR</button>
+                <button data-src="rtsp">RTSP camera</button>
+                <button data-src="onvif">ONVIF camera</button>
               </div>
-              <input type="password" id="addDvrPass" placeholder="DVR Password (leave blank for site default)" class="search-input">
-              <button id="btnSubmitAddDvr" class="primary" style="width:100%;">Save DVR</button>
+              <div style="display:flex; gap:8px;">
+                <input type="text" id="addDvrKey" placeholder="ID (e.g. gate_cam)" class="search-input" style="flex:1;" autocomplete="off">
+                <input type="text" id="addDvrLabel" placeholder="Display name" class="search-input" style="flex:2;" autocomplete="off">
+              </div>
+
+              <div class="src-pane on" data-pane="dvrip">
+                <div style="display:flex; gap:8px;">
+                  <input type="text" id="addDvrIp" placeholder="IP / Hostname" class="search-input" style="flex:2;">
+                  <input type="number" id="addDvrPort" placeholder="Port (3456)" class="search-input" value="3456" style="flex:1;">
+                  <input type="number" id="addDvrChs" placeholder="Channels (8)" class="search-input" value="8" style="flex:1;">
+                </div>
+                <input type="password" id="addDvrPass" placeholder="DVR Password (leave blank for site default)" class="search-input" autocomplete="new-password">
+              </div>
+
+              <div class="src-pane" data-pane="rtsp">
+                <input type="text" id="camRtspUrl" placeholder="rtsp://user:pass@camera-ip:554/stream" class="search-input" autocomplete="off" spellcheck="false">
+                <details>
+                  <summary class="src-hint" style="cursor:pointer;">Optional: separate high-quality stream for full view</summary>
+                  <input type="text" id="camRtspMain" placeholder="rtsp://… main stream (leave blank to use the one above)" class="search-input" style="margin-top:6px; width:100%;" autocomplete="off" spellcheck="false">
+                </details>
+                <p class="src-hint">Use the camera's <b>low-resolution sub-stream</b> above if it has one. This board decodes every tile in software, so a full-HD stream per tile costs a lot of CPU.</p>
+              </div>
+
+              <div class="src-pane" data-pane="onvif">
+                <button id="btnScanOnvif" class="ghost" style="width:100%; font-size:12px;">🔍 Find cameras on the network</button>
+                <div id="scanList" class="scan-list"></div>
+                <div style="display:flex; gap:8px;">
+                  <input type="text" id="camOnvifHost" placeholder="Camera IP" class="search-input" style="flex:3;" autocomplete="off">
+                  <input type="number" id="camOnvifPort" placeholder="Port" value="80" class="search-input" style="flex:1;">
+                </div>
+                <div style="display:flex; gap:8px;">
+                  <input type="text" id="camOnvifUser" placeholder="Username" class="search-input" style="flex:1;" autocomplete="off">
+                  <input type="password" id="camOnvifPass" placeholder="Password" class="search-input" style="flex:1;" autocomplete="new-password">
+                </div>
+                <p class="src-hint">Pan/tilt/zoom controls show up automatically if the camera supports them.</p>
+              </div>
+
+              <img id="camPreview" class="src-preview" alt="">
+              <p id="camMsg" class="src-msg"></p>
+              <div class="src-actions">
+                <button id="btnTestCam" class="ghost" style="display:none;">Test</button>
+                <button id="btnSubmitAddDvr" class="primary">Save</button>
+              </div>
             </div>
           </div>
         </section>
@@ -996,6 +1060,7 @@ HTML = """<!DOCTYPE html>
   </div>
 
 <script>
+{% raw %}/*PTZ_JS*/{% endraw %}
 let CHANNELS = [];
 let PROFILES = {};
 let ACTIVE = null;
@@ -1054,6 +1119,14 @@ function tileEl(c, inProfile) {
   offline.className = 'offline';
   offline.textContent = 'offline';
   offline.style.display = 'none';
+
+  if (c.ptz) {
+    const badge = document.createElement('div');
+    badge.className = 'ptz-badge';
+    badge.textContent = 'PTZ';
+    badge.title = 'Open full view to pan, tilt and zoom';
+    div.appendChild(badge);
+  }
 
   const label = document.createElement('div');
   label.className = 'label';
@@ -1340,7 +1413,9 @@ function refreshFsFrame() {
     if (!isWebFullscreenActive) return;
     img.src = nextImg.src;
     clearTimeout(fsPollTimer);
-    fsPollTimer = setTimeout(refreshFsFrame, 600);
+    // Faster while someone is steering a PTZ camera: the picture is the only
+    // feedback they get, so stale frames make the camera feel unresponsive.
+    fsPollTimer = setTimeout(refreshFsFrame, PTZ.active() ? 350 : 600);
   };
   nextImg.onerror = () => {
     if (!isWebFullscreenActive) return;
@@ -1387,10 +1462,20 @@ async function fullscreen(dvr, ch) {
   clearTimeout(fsPollTimer);
   fsPollTimer = setTimeout(refreshFsFrame, 500);
 
+  // 4. PTZ controls, only if this source is a PTZ-capable ONVIF camera.
+  PTZ.detach();
+  PTZ.supported(dvr).then(ok => {
+    if (ok && isWebFullscreenActive && currentFsTarget && currentFsTarget.dvr === dvr) {
+      PTZ.attach(document.getElementById('webFsStage'), dvr);
+      title.textContent = label + ' • drag to look around';
+    }
+  });
+
   await refreshStatus();
 }
 
 async function closeWebFullscreen() {
+  PTZ.detach();
   isWebFullscreenActive = false;
   currentFsTarget = null;
   clearTimeout(fsPollTimer);
@@ -1567,10 +1652,14 @@ async function loadSettingsModal() {
     for (const [key, d] of Object.entries(dData.dvrs)) {
       const row = document.createElement('div');
       row.className = 'dvr-item';
+      const kind = d.type === 'rtsp' ? 'RTSP' : d.type === 'onvif' ? 'ONVIF' : 'DVR';
+      const sub = d.type === 'rtsp' ? escHtml(d.url || '')
+                : d.type === 'onvif' ? `${escHtml(d.ip)}:${d.port}`
+                : `${escHtml(d.ip)}:${d.port} • ${d.channels} Channels`;
       row.innerHTML = `
         <div class="dvr-info">
-          <div class="dvr-title">${d.label || key.toUpperCase()}</div>
-          <div class="dvr-sub">${d.ip}:${d.port} • ${d.channels} Channels</div>
+          <div class="dvr-title">${escHtml(d.label || key.toUpperCase())}<span class="type-badge">${kind}</span>${d.ptz ? '<span class="type-badge ptz">PTZ</span>' : ''}</div>
+          <div class="dvr-sub" style="overflow-wrap:anywhere;">${sub}</div>
         </div>
         <div class="dvr-controls">
           <label class="switch" title="Toggle DVR ON/OFF (Save WAN Bandwidth)">
@@ -1648,33 +1737,150 @@ async function loadSettingsModal() {
   }
 }
 
-document.getElementById('btnSubmitAddDvr').addEventListener('click', async () => {
-  const key = document.getElementById('addDvrKey').value.trim();
-  const label = document.getElementById('addDvrLabel').value.trim();
-  const ip = document.getElementById('addDvrIp').value.trim();
-  const port = parseInt(document.getElementById('addDvrPort').value.trim(), 10) || 3456;
-  const channels = parseInt(document.getElementById('addDvrChs').value.trim(), 10) || 8;
-  const password = document.getElementById('addDvrPass').value.trim();
+function escHtml(t) {
+  return String(t == null ? '' : t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
-  if (!key || !ip) {
-    alert('Identifier and IP are required');
-    return;
+/* ---- Add source form: DVR / RTSP camera / ONVIF camera ---- */
+let srcType = 'dvrip';
+const $ = id => document.getElementById(id);
+
+function camMsg(text, kind) {
+  const m = $('camMsg');
+  m.textContent = text || '';
+  m.className = 'src-msg' + (kind ? ' ' + kind : '');
+}
+
+function resetCamForm() {
+  camMsg('');
+  $('camPreview').style.display = 'none';
+  $('camPreview').removeAttribute('src');
+}
+
+document.querySelectorAll('.src-tabs button').forEach(b => b.addEventListener('click', () => {
+  srcType = b.dataset.src;
+  document.querySelectorAll('.src-tabs button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.src-pane').forEach(p => p.classList.toggle('on', p.dataset.pane === srcType));
+  $('btnTestCam').style.display = srcType === 'dvrip' ? 'none' : '';
+  resetCamForm();
+}));
+
+/* Suggest an ID from the display name so most people never type one. */
+$('addDvrLabel').addEventListener('input', () => {
+  const k = $('addDvrKey');
+  if (k.dataset.touched) return;
+  k.value = $('addDvrLabel').value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 24);
+});
+$('addDvrKey').addEventListener('input', () => { $('addDvrKey').dataset.touched = '1'; });
+
+function camPayload() {
+  const p = {type: srcType, key: $('addDvrKey').value.trim().toLowerCase(), label: $('addDvrLabel').value.trim()};
+  if (srcType === 'rtsp') {
+    p.url = $('camRtspUrl').value.trim();
+    p.url_main = $('camRtspMain').value.trim();
+  } else {
+    p.ip = $('camOnvifHost').value.trim();
+    p.port = $('camOnvifPort').value.trim() || '80';
+    p.user = $('camOnvifUser').value.trim();
+    p.password = $('camOnvifPass').value;
   }
+  return p;
+}
 
-  const r = await fetch('/api/dvr/add', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({dvr: key, label, ip, port, channels, password})
-  });
-  if (r.ok) {
-    setStatus(`DVR '${label || key}' added!`);
-    document.getElementById('addDvrForm').style.display = 'none';
+async function postJson(url, body) {
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  return {ok: r.ok, j};
+}
+
+$('btnTestCam').addEventListener('click', async () => {
+  const btn = $('btnTestCam');
+  btn.disabled = true; btn.textContent = 'Testing…';
+  resetCamForm(); camMsg('Connecting to the camera…');
+  try {
+    const {j} = await postJson('/api/camera/test', camPayload());
+    if (j.ok) {
+      $('camPreview').src = j.preview;
+      $('camPreview').style.display = 'block';
+      camMsg('✓ Picture received' + (j.name ? ' from ' + j.name : '') + (j.ptz ? ' • PTZ supported' : ''), 'ok');
+    } else {
+      camMsg(j.error || 'Test failed', 'err');
+    }
+  } catch (e) {
+    camMsg('Test failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Test';
+  }
+});
+
+$('btnScanOnvif').addEventListener('click', async () => {
+  const btn = $('btnScanOnvif'), list = $('scanList');
+  btn.disabled = true; btn.textContent = 'Scanning… (3 s)';
+  list.innerHTML = '';
+  try {
+    const {ok, j} = await postJson('/api/camera/discover', {});
+    if (!ok) { camMsg(j.error || 'Scan failed', 'err'); return; }
+    if (!j.cameras.length) {
+      list.innerHTML = '<p class="src-hint">No cameras answered. They must be on the same network as this device — you can still type the IP below.</p>';
+      return;
+    }
+    for (const c of j.cameras) {
+      const it = document.createElement('div');
+      it.className = 'scan-item';
+      it.innerHTML = `<span><b>${escHtml(c.name || c.hardware || 'ONVIF camera')}</b><br><small>${escHtml(c.host)}${c.hardware && c.name ? ' • ' + escHtml(c.hardware) : ''}</small></span>`
+        + `<small>${c.added ? 'already added' : 'select →'}</small>`;
+      it.addEventListener('click', () => {
+        $('camOnvifHost').value = c.host;
+        $('camOnvifPort').value = c.port || 80;
+        if (!$('addDvrLabel').value) {
+          $('addDvrLabel').value = c.name || c.hardware || '';
+          $('addDvrLabel').dispatchEvent(new Event('input'));
+        }
+        list.querySelectorAll('.scan-item').forEach(x => x.style.borderColor = '');
+        it.style.borderColor = 'var(--accent)';
+        $('camOnvifUser').focus();
+      });
+      list.appendChild(it);
+    }
+  } catch (e) {
+    camMsg('Scan failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = '🔍 Find cameras on the network';
+  }
+});
+
+$('btnSubmitAddDvr').addEventListener('click', async () => {
+  const key = $('addDvrKey').value.trim();
+  const label = $('addDvrLabel').value.trim();
+  if (!key) { camMsg('Give it a name or ID first', 'err'); return; }
+
+  let res;
+  if (srcType === 'dvrip') {
+    const ip = $('addDvrIp').value.trim();
+    const port = parseInt($('addDvrPort').value.trim(), 10) || 3456;
+    const channels = parseInt($('addDvrChs').value.trim(), 10) || 8;
+    const password = $('addDvrPass').value.trim();
+    if (!ip) { camMsg('IP is required', 'err'); return; }
+    res = await postJson('/api/dvr/add', {dvr: key, label, ip, port, channels, password});
+  } else {
+    camMsg('Saving…');
+    res = await postJson('/api/camera/add', camPayload());
+  }
+  if (res.ok) {
+    setStatus(`'${label || key}' added` + (res.j.ptz ? ' (PTZ ready)' : ''));
+    $('addDvrForm').style.display = 'none';
+    ['addDvrKey', 'addDvrLabel', 'camRtspUrl', 'camRtspMain', 'camOnvifHost', 'camOnvifUser', 'camOnvifPass']
+      .forEach(id => { $(id).value = ''; });
+    delete $('addDvrKey').dataset.touched;
+    $('scanList').innerHTML = '';
+    resetCamForm();
+    await loadChannels();          // first, so the names list below includes the new source
     await loadSettingsModal();
-    await loadChannels();
     renderKioskGrid();
     renderPool();
   } else {
-    alert('Failed to add DVR');
+    camMsg(res.j.error || 'Failed to save', 'err');
   }
 });
 
@@ -1838,6 +2044,10 @@ init();
 </html>
 """
 
+# Shared PTZ controls (ptz_ui.py). Spliced in rather than written inline so the
+# dashboard and /wall run the same code; the {% raw %} guards keep Jinja away.
+HTML = HTML.replace("/*PTZ_CSS*/", PTZ_CSS).replace("/*PTZ_JS*/", PTZ_JS)
+
 # ---- Static & Security Middleware ----
 
 @app.after_request
@@ -1947,13 +2157,20 @@ def api_dvr_list():
     safe_dvrs = {}
     for k, v in dvrs.items():
         safe_dvrs[k] = {
+            "type": dvr_config.source_type(v),
             "label": v.get("label", k),
             "ip": v.get("ip"),
             "port": v.get("port", 3456),
             "channels": v.get("channels", 8),
             "enabled": v.get("enabled", True),
-            "reachable": dvr_reachable(k)
+            "reachable": dvr_reachable(k),
+            "ptz": bool(v.get("ptz")),
         }
+        # Never send credentials back to the browser.
+        if v.get("url"):
+            safe_dvrs[k]["url"] = dvr_config.mask_url(v["url"])
+        if v.get("user"):
+            safe_dvrs[k]["user"] = v["user"]
     return jsonify({"dvrs": safe_dvrs, "order": dvr_config.get_dvr_order()})
 
 
@@ -2005,6 +2222,267 @@ def api_dvr_delete():
     return jsonify({"error": "DVR not found"}), 404
 
 
+# ---- Single cameras (RTSP / ONVIF) ----
+
+_KEY_RE = re.compile(r"^[a-z0-9_]{1,24}$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9.\-]{1,253}$")
+
+
+def _valid_rtsp(url):
+    if not url or len(url) > 400 or any(c.isspace() for c in url):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return parts.scheme in ("rtsp", "rtsps") and bool(parts.hostname)
+
+
+def _camera_body(body):
+    """Validate the camera part of an add/test request. Returns (fields, error)."""
+    ctype = body.get("type")
+    f = {"type": ctype, "label": str(body.get("label", "")).strip()[:60]}
+    if ctype == "rtsp":
+        url = str(body.get("url", "")).strip()
+        url_main = str(body.get("url_main", "")).strip()
+        if not _valid_rtsp(url):
+            return None, "Enter a valid rtsp:// address (no spaces)"
+        if url_main and not _valid_rtsp(url_main):
+            return None, "The high-quality address must also be rtsp://"
+        f.update(url=url, url_main=url_main)
+    elif ctype == "onvif":
+        host = str(body.get("ip", "")).strip()
+        port = str(body.get("port", "80")).strip() or "80"
+        if not _HOST_RE.match(host):
+            return None, "Enter the camera's IP address or hostname"
+        if not port.isdigit() or not (0 < int(port) < 65536):
+            return None, "Port must be a number"
+        f.update(ip=host, port=int(port), user=str(body.get("user", "")).strip()[:64],
+                 password=str(body.get("password", ""))[:128])
+    else:
+        return None, "Unknown camera type"
+    return f, None
+
+
+def _go2rtc(method, path, timeout=8):
+    req = urllib.request.Request(f"http://127.0.0.1:{GO2RTC_HTTP_PORT}{path}", method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+@app.route('/api/camera/test', methods=['POST'])
+@require_auth
+def api_camera_test():
+    """Grab one frame before saving, so a typo shows up in the form rather than
+    as a black tile on the TV. go2rtc connects through a temporary stream that
+    is deleted afterwards -- a single short decode, not a lasting cost."""
+    body = request.get_json(force=True) or {}
+    f, err = _camera_body(body)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    if f["type"] == "onvif" and not f["password"]:
+        existing = dvr_config.get_dvrs().get(str(body.get("key", "")).strip().lower(), {})
+        f["password"] = existing.get("password", "")
+    result = {"ok": False}
+    if f["type"] == "onvif":
+        try:
+            info = onvif_util.probe(f["ip"], f["port"], f["user"], f["password"])
+            result.update(ptz=info["ptz"], name=info["name"])
+        except onvif_util.OnvifError as e:
+            return jsonify({"ok": False, "error": f"ONVIF: {e}"})
+    src = dvr_config.source_urls(dict(f, channels=1), 1)[0]
+    name = "probe_" + secrets.token_hex(4)
+    try:
+        _go2rtc("PUT", f"/api/streams?name={name}&src={urllib.parse.quote(src, safe='')}")
+        data = _go2rtc("GET", f"/api/frame.jpeg?src={name}")
+        if data and len(data) > 100:
+            result.update(ok=True, preview="data:image/jpeg;base64," + base64.b64encode(data).decode())
+        else:
+            result["error"] = "Connected, but the camera sent no picture"
+    except Exception as e:
+        result["error"] = "No picture from the camera — check the address and password"
+        print(f"[camera] test failed: {e}")
+    finally:
+        try:
+            _go2rtc("DELETE", f"/api/streams?src={name}", timeout=3)
+        except Exception:
+            pass
+    return jsonify(result)
+
+
+@app.route('/api/camera/add', methods=['POST'])
+@require_auth
+def api_camera_add():
+    body = request.get_json(force=True) or {}
+    key = str(body.get("key", "")).strip().lower()
+    if not _KEY_RE.match(key):
+        return jsonify({"error": "ID: lowercase letters, numbers and _ only"}), 400
+    existing = dvr_config.get_dvrs().get(key)
+    if existing and dvr_config.source_type(existing) == "dvrip":
+        return jsonify({"error": f"'{key}' is already used by a DVR"}), 409
+    f, err = _camera_body(body)
+    if err:
+        return jsonify({"error": err}), 400
+    ctype, label = f.pop("type"), f.pop("label")
+    if ctype == "onvif" and not f["password"] and existing:
+        f["password"] = existing.get("password", "")    # blank = keep current
+    if not dvr_config.add_or_update_camera(key, label, ctype, **f):
+        return jsonify({"error": "Failed to save"}), 500
+    if ctype == "onvif":
+        _learn_ptz(key)        # best effort: the picture works without PTZ
+    with _reach_lock:
+        _reach_cache.pop(key, None)
+    ensure_roster()
+    return jsonify({"ok": True, "ptz": bool(dvr_config.get_dvrs()[key].get("ptz"))})
+
+
+@app.route('/api/camera/discover', methods=['POST'])
+@require_auth
+def api_camera_discover():
+    try:
+        cams = onvif_util.discover(timeout=3.0)
+    except RuntimeError:
+        return jsonify({"error": "A scan is already running"}), 429
+    except OSError as e:
+        return jsonify({"error": f"Scan failed: {e}"}), 500
+    known = {d.get("ip") for d in dvr_config.get_dvrs().values()}
+    for c in cams:
+        c["added"] = c["host"] in known
+    return jsonify({"cameras": cams})
+
+
+# ---- PTZ (ONVIF cameras) ----
+#
+# Every move arms a server-side timer that sends Stop unless the browser renews
+# the move first. The UI renews about once a second while a control is held,
+# so a closed tab, a dropped Wi-Fi link or a crashed browser can never leave a
+# camera spinning.
+
+PTZ_SAFETY_STOP_SEC = 1.5
+_ptz_lock = threading.Lock()
+_ptz_timers = {}              # key -> threading.Timer
+_ptz_last = {}                # key -> (viewer_id, time) of the last move
+
+
+def _learn_ptz(key):
+    d = dvr_config.get_dvrs().get(key, {})
+    try:
+        info = onvif_util.probe(d.get("ip"), d.get("port", 80), d.get("user"), d.get("password"))
+    except onvif_util.OnvifError as e:
+        print(f"[ptz] probe {key} failed: {e}")
+        return None
+    dvr_config.set_fields(key, ptz=info["ptz"], ptz_xaddr=info["ptz_xaddr"],
+                          media_xaddr=info["media_xaddr"], profile_token=info["profile_token"])
+    return info
+
+
+def _ptz_cam(key):
+    d = dvr_config.get_dvrs().get(key)
+    if not d or dvr_config.source_type(d) != "onvif":
+        return None, ("Not an ONVIF camera", 404)
+    if not d.get("ptz_xaddr") or not d.get("profile_token"):
+        if not _learn_ptz(key):
+            return None, ("Camera is not answering ONVIF requests", 502)
+        d = dvr_config.get_dvrs().get(key)
+    if not d.get("ptz"):
+        return None, ("This camera can't pan or tilt", 400)
+    return d, None
+
+
+def _viewer_id():
+    tok = request.cookies.get(SESSION_COOKIE_NAME) or request.headers.get("Authorization", "")
+    return hashlib.sha1(tok.encode()).hexdigest()[:12]
+
+
+def _arm_safety_stop(key, cam):
+    def fire():
+        with _ptz_lock:
+            if _ptz_timers.get(key) is not timer:
+                return
+            _ptz_timers.pop(key, None)
+        try:
+            onvif_util.stop(cam)
+        except onvif_util.OnvifError:
+            pass
+    timer = threading.Timer(PTZ_SAFETY_STOP_SEC, fire)
+    timer.daemon = True
+    with _ptz_lock:
+        old = _ptz_timers.pop(key, None)
+        if old:
+            old.cancel()
+        _ptz_timers[key] = timer
+    timer.start()
+
+
+def _ptz_route(fn):
+    """Resolve the camera and turn ONVIF failures into short JSON errors."""
+    @functools.wraps(fn)
+    def wrapper(key):
+        cam, err = _ptz_cam(key)
+        if err:
+            return jsonify({"error": err[0]}), err[1]
+        try:
+            return fn(key, cam)
+        except onvif_util.OnvifError as e:
+            return jsonify({"error": str(e)}), 502
+    return wrapper
+
+
+@app.route('/api/ptz/<key>/move', methods=['POST'])
+@require_auth
+@_ptz_route
+def api_ptz_move(key, cam):
+    b = request.get_json(force=True) or {}
+    me, now = _viewer_id(), time.time()
+    with _ptz_lock:
+        prev = _ptz_last.get(key)
+        _ptz_last[key] = (me, now)
+    onvif_util.continuous_move(cam, b.get("pan", 0), b.get("tilt", 0), b.get("zoom", 0))
+    _arm_safety_stop(key, cam)
+    return jsonify({"ok": True, "other_viewer": bool(prev and prev[0] != me and now - prev[1] < 3)})
+
+
+@app.route('/api/ptz/<key>/stop', methods=['POST'])
+@require_auth
+@_ptz_route
+def api_ptz_stop(key, cam):
+    with _ptz_lock:
+        t = _ptz_timers.pop(key, None)
+    if t:
+        t.cancel()
+    onvif_util.stop(cam)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/ptz/<key>/home', methods=['POST'])
+@require_auth
+@_ptz_route
+def api_ptz_home(key, cam):
+    onvif_util.goto_home(cam)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/ptz/<key>/presets', methods=['GET', 'POST'])
+@require_auth
+@_ptz_route
+def api_ptz_presets(key, cam):
+    """GET lists presets. POST {action: goto|save|remove, token?, name?}."""
+    if request.method == 'GET':
+        return jsonify({"presets": onvif_util.get_presets(cam)})
+    b = request.get_json(force=True) or {}
+    action, token = b.get("action"), b.get("token")
+    name = str(b.get("name", "")).strip()[:40]
+    if action == "goto" and token:
+        onvif_util.goto_preset(cam, token)
+    elif action == "save" and name:
+        token = onvif_util.set_preset(cam, name, token)
+    elif action == "remove" and token:
+        onvif_util.remove_preset(cam, token)
+    else:
+        return jsonify({"error": "bad request"}), 400
+    return jsonify({"ok": True, "token": token})
+
+
 # ---- Channel & Stream Endpoints ----
 
 @app.route('/api/channels')
@@ -2025,6 +2503,7 @@ def api_channels():
             "defaultLabel": default_lbl,
             "customLabel": custom_lbl,
             "dvrLabel": dvrs.get(dvr_key, {}).get("label", dvr_key.upper()),
+            "ptz": bool(dvrs.get(dvr_key, {}).get("ptz")),
         })
     return jsonify(out)
 
@@ -2376,6 +2855,7 @@ def api_wall_layout():
         chans = get_all_active_channels()
 
     health = stream_health()
+    dvrs = dvr_config.get_dvrs()
     tiles = []
     for c in chans:
         dvr_key, ch = c.get("dvr"), c.get("ch")
@@ -2386,11 +2866,20 @@ def api_wall_layout():
             "ch": ch,
             "label": channel_labels.get_label(dvr_key, ch),
             "online": bool(st.get("have_frame")),
+            "ptz": bool(dvrs.get(dvr_key, {}).get("ptz")),
         })
+
+    # The fullscreen channel needn't be in the active profile (e.g. a camera
+    # added a minute ago), so describe it fully rather than by reference.
+    fs = None
+    if fullscreen_target:
+        fk, fc = fullscreen_target.get("dvr"), fullscreen_target.get("ch")
+        fs = {"dvr": fk, "ch": fc, "label": channel_labels.get_label(fk, fc),
+              "ptz": bool(dvrs.get(fk, {}).get("ptz"))}
 
     return jsonify({
         "mode": current_mode,
-        "fullscreen": fullscreen_target,
+        "fullscreen": fs,
         "thumb_fps": governor_thumb_fps,
         "tiles": tiles,
     })

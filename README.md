@@ -27,6 +27,8 @@ Combines an ultra-efficient C-based HDMI video wall compositor (`dvrwall`) with 
 - 🕗 **Operating-Hours Power Schedule**: Configurable daily on/off window that drops every decoder connection when the wall is off, so an idle wall costs essentially no CPU. Manual on/off from the dashboard is honoured until the next boundary.
 - 🔁 **Optional Nightly Reboot**: Systemd timer shipped installed-but-disabled (`systemctl enable --now dvr-kiosk-reboot.timer`), with a configurable `OnCalendar`.
 - 🖥️ **Browser Video Wall (`/wall`)**: Chrome-free page that mirrors the TV exactly — same profile order, and it follows the kiosk into fullscreen. Landscape renders the full grid edge to edge; portrait paginates into swipeable pages so tiles stay readable on a phone. Frames are polled `<img>` rather than MJPEG (16 MJPEG streams would occupy the entire web-server thread pool), each tile chains its next request off the previous one so requests never queue, offscreen tiles stop polling entirely, and the poll rate follows the CPU governor's current tier.
+- 📷 **Standalone Cameras (RTSP & ONVIF)**: Besides multi-channel DVRs, add a single camera from **Settings → Add DVR or Camera** — paste an `rtsp://` address, or pick an ONVIF camera found by a network scan (WS-Discovery). A **Test** button grabs one frame before saving so typos never become black tiles. Cameras are relayed through go2rtc like everything else, so the wall, profiles, labels and `/wall` treat them as ordinary channels. Credentials are never sent back to the browser.
+- 🕹️ **PTZ Control for ONVIF Cameras**: In full view, drag on the picture to look around (drag distance = speed), wheel/pinch to zoom, or use the auto-hiding pad; saved views appear as one-tap chips. Every move is renewed while held and the server stops the camera itself if renewals stop, so a closed tab or dropped Wi-Fi can't leave it spinning. ONVIF is spoken with the standard library only — no heavy SOAP stack on a 512 MB board.
 - ⌨️ **Interactive CLI Tool (`dvr-kiosk`)**: Built-in terminal dashboard for password changes, service restarts, and configuration management.
 
 ---
@@ -47,6 +49,18 @@ curl -fsSL https://raw.githubusercontent.com/tahashemi/DVR-kiosk/main/install.sh
 5. Configures security hardening (`fail2ban`, token auth).
 6. Installs and starts all systemd background services (`go2rtc.service`, `dvrwall.service`, `dvr-kiosk.service`).
 7. Installs the interactive `dvr-kiosk` CLI command.
+
+---
+
+## 🔄 Updating (1-Line, Code Only)
+
+Pull the latest application code from GitHub onto an installed device:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tahashemi/DVR-kiosk/main/update.sh | sudo bash
+```
+
+It finds where the running service loads its code from, syntax-checks the new version before swapping anything, backs up every replaced file, and rolls back automatically if the service doesn't come back healthy. It never touches configuration, credentials, go2rtc or systemd units. `BRANCH=dev` selects another branch.
 
 ---
 

@@ -25,7 +25,21 @@ throwaway test output belongs in `tools/` or `scratch/`, never in the repo.
 
 ## Deploying to a device
 
-There is no CI. You copy files to the box, restart the unit, and verify.
+**Python code ships through GitHub.** Push to `main`, then on the device:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tahashemi/DVR-kiosk/main/update.sh | sudo bash
+```
+
+`update.sh` reads the service unit to find where the code actually runs (some
+devices predate the `/opt/dvr-kiosk` layout and run from `/root`),
+syntax-checks, backs up, swaps, restarts, and rolls back if the web UI doesn't
+answer. It never touches config, credentials, go2rtc or units. Before the first
+update of a hand-built device, compare its live modules with the repo
+(`md5sum`, ignoring CRLF) — a device-local edit would otherwise be overwritten
+silently.
+
+The manual path below remains for the C compositor and for emergencies.
 
 ```bash
 # Python: no build step
