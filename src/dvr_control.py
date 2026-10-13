@@ -843,6 +843,8 @@ HTML = """<!DOCTYPE html>
   .scan-item { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; cursor:pointer; font-size:12px; }
   .scan-item:hover { border-color:var(--accent); }
   .scan-item small { color:var(--text-dim); }
+  .slot-lbl { font-size:11px; font-weight:700; color:var(--text); margin:2px 0 -4px; letter-spacing:.02em; }
+  .slot-lbl small { font-weight:500; color:var(--text-dim); }
   .type-badge { display:inline-block; font-size:9px; font-weight:700; letter-spacing:.05em; padding:1px 5px; border-radius:4px; margin-left:6px; vertical-align:middle; background:rgba(255,255,255,.1); color:var(--text-dim); }
   .type-badge.ptz { background:rgba(59,130,246,.25); color:#93c5fd; }
   {% raw %}/*PTZ_CSS*/{% endraw %}
@@ -971,12 +973,12 @@ HTML = """<!DOCTYPE html>
               </div>
 
               <div class="src-pane" data-pane="rtsp">
-                <input type="text" id="camRtspUrl" placeholder="rtsp://user:pass@camera-ip:554/stream" class="search-input" autocomplete="off" spellcheck="false">
-                <details>
-                  <summary class="src-hint" style="cursor:pointer;">Optional: separate high-quality stream for full view</summary>
-                  <input type="text" id="camRtspMain" placeholder="rtsp://… main stream (leave blank to use the one above)" class="search-input" style="margin-top:6px; width:100%;" autocomplete="off" spellcheck="false">
-                </details>
-                <p class="src-hint">Use the camera's <b>low-resolution sub-stream</b> above if it has one. This board decodes every tile in software, so a full-HD stream per tile costs a lot of CPU.</p>
+                <label class="slot-lbl">Low quality <small>— grid &amp; thumbnails</small></label>
+                <input type="text" id="camRtspUrl" placeholder="rtsp://user:pass@camera-ip:554/…sub" class="search-input" autocomplete="off" spellcheck="false">
+                <label class="slot-lbl">High quality <small>— full view</small></label>
+                <input type="text" id="camRtspMain" placeholder="rtsp://user:pass@camera-ip:554/…main" class="search-input" autocomplete="off" spellcheck="false">
+                <button id="btnDetectRtsp" class="ghost" style="width:100%; font-size:12px;">✨ Auto-detect from the address you entered</button>
+                <p class="src-hint">Enter either address and press Auto-detect to find the other one and check both resolutions. This board decodes every grid tile in software, so the grid should always use a small sub-stream.</p>
               </div>
 
               <div class="src-pane" data-pane="onvif">
@@ -990,8 +992,16 @@ HTML = """<!DOCTYPE html>
                   <input type="text" id="camOnvifUser" placeholder="Username" class="search-input" style="flex:1;" autocomplete="off">
                   <input type="password" id="camOnvifPass" placeholder="Password" class="search-input" style="flex:1;" autocomplete="new-password">
                 </div>
-                <p class="src-hint">Pan/tilt/zoom controls show up automatically if the camera supports them.</p>
+                <button id="btnDetectOnvif" class="ghost" style="width:100%; font-size:12px;">✨ Detect streams</button>
+                <div id="onvifStreams" style="display:none; flex-direction:column; gap:8px;">
+                  <label class="slot-lbl">Low quality <small>— grid &amp; thumbnails</small></label>
+                  <select id="camOnvifSub" class="search-input" style="width:100%;"></select>
+                  <label class="slot-lbl">High quality <small>— full view</small></label>
+                  <select id="camOnvifMain" class="search-input" style="width:100%;"></select>
+                </div>
+                <p class="src-hint">Streams are picked automatically (smallest H.264 for the grid, largest for full view) — Detect lets you see and change the choice. Pan/tilt/zoom controls show up automatically if the camera supports them.</p>
               </div>
+              <p id="camNote" class="src-hint" style="display:none; color:#fbbf24;"></p>
 
               <img id="camPreview" class="src-preview" alt="">
               <p id="camMsg" class="src-msg"></p>
@@ -1751,8 +1761,14 @@ function camMsg(text, kind) {
   m.className = 'src-msg' + (kind ? ' ' + kind : '');
 }
 
+function camNote(text) {
+  const n = $('camNote');
+  n.textContent = text || '';
+  n.style.display = text ? 'block' : 'none';
+}
+
 function resetCamForm() {
-  camMsg('');
+  camMsg(''); camNote('');
   $('camPreview').style.display = 'none';
   $('camPreview').removeAttribute('src');
 }
@@ -1783,6 +1799,10 @@ function camPayload() {
     p.port = $('camOnvifPort').value.trim() || '80';
     p.user = $('camOnvifUser').value.trim();
     p.password = $('camOnvifPass').value;
+    if ($('onvifStreams').style.display !== 'none') {
+      p.sub_token = $('camOnvifSub').value;
+      p.main_token = $('camOnvifMain').value;
+    }
   }
   return p;
 }
@@ -1803,7 +1823,8 @@ $('btnTestCam').addEventListener('click', async () => {
     if (j.ok) {
       $('camPreview').src = j.preview;
       $('camPreview').style.display = 'block';
-      camMsg('✓ Picture received' + (j.name ? ' from ' + j.name : '') + (j.ptz ? ' • PTZ supported' : ''), 'ok');
+      camMsg('✓ ' + (j.size ? j.size + ' picture' : 'Picture') + ' received' + (j.name ? ' from ' + j.name : '')
+             + (j.main_size ? ' • full view ' + j.main_size : '') + (j.ptz ? ' • PTZ supported' : ''), 'ok');
     } else {
       camMsg(j.error || 'Test failed', 'err');
     }
@@ -1812,6 +1833,64 @@ $('btnTestCam').addEventListener('click', async () => {
   } finally {
     btn.disabled = false; btn.textContent = 'Test';
   }
+});
+
+/* ---- Low/high stream detection ---- */
+async function runDetect(btn, label) {
+  btn.disabled = true; const old = btn.textContent; btn.textContent = label;
+  camMsg(''); camNote('');
+  try {
+    const {ok, j} = await postJson('/api/camera/detect', camPayload());
+    if (!ok || j.error) { camMsg(j.error || 'Detection failed', 'err'); return null; }
+    camNote(j.note);
+    return j;
+  } catch (e) {
+    camMsg('Detection failed: ' + e.message, 'err'); return null;
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+$('btnDetectRtsp').addEventListener('click', async () => {
+  if (!$('camRtspUrl').value.trim() && !$('camRtspMain').value.trim()) {
+    camMsg('Enter at least one address first', 'err'); return;
+  }
+  const j = await runDetect($('btnDetectRtsp'), 'Checking streams…');
+  if (!j) return;
+  $('camRtspUrl').value = j.url;
+  $('camRtspMain').value = j.url_main;
+  const low = j.streams[0], high = j.streams[j.streams.length - 1];
+  camMsg(j.streams.length > 1
+    ? `✓ Found ${j.streams.length} streams — low ${low.width}×${low.height}, high ${high.width}×${high.height}`
+    : `✓ One stream, ${low.width}×${low.height}`, 'ok');
+});
+
+$('btnDetectOnvif').addEventListener('click', async () => {
+  if (!$('camOnvifHost').value.trim()) { camMsg('Enter the camera IP first', 'err'); return; }
+  const j = await runDetect($('btnDetectOnvif'), 'Asking the camera…');
+  if (!j) return;
+  const fill = (sel, chosen) => {
+    sel.innerHTML = '';
+    for (const p of j.profiles) {
+      const o = document.createElement('option');
+      o.value = p.token;
+      o.textContent = `${p.width}×${p.height} ${p.codec} — ${p.name}`;
+      o.selected = p.token === chosen;
+      sel.appendChild(o);
+    }
+  };
+  fill($('camOnvifSub'), j.sub_token);
+  fill($('camOnvifMain'), j.main_token);
+  $('onvifStreams').style.display = 'flex';
+  camMsg(`✓ ${j.profiles.length} stream${j.profiles.length > 1 ? 's' : ''} found — change the choice below if you like`, 'ok');
+});
+
+/* Re-evaluate the size warning when the full-view choice changes. */
+$('camOnvifMain').addEventListener('change', () => {
+  const t = $('camOnvifMain').selectedOptions[0].textContent;
+  const m = t.match(/^([0-9]+)×([0-9]+)/);
+  camNote(m && (+m[1]) * (+m[2]) > 1920 * 1088
+    ? `${m[1]}×${m[2]} is larger than 1080p — this board decodes in software, so full view will have a low frame rate.` : '');
 });
 
 $('btnScanOnvif').addEventListener('click', async () => {
@@ -1874,6 +1953,7 @@ $('btnSubmitAddDvr').addEventListener('click', async () => {
       .forEach(id => { $(id).value = ''; });
     delete $('addDvrKey').dataset.touched;
     $('scanList').innerHTML = '';
+    $('onvifStreams').style.display = 'none';
     resetCamForm();
     await loadChannels();          // first, so the names list below includes the new source
     await loadSettingsModal();
@@ -2239,17 +2319,25 @@ def _valid_rtsp(url):
 
 
 def _camera_body(body):
-    """Validate the camera part of an add/test request. Returns (fields, error)."""
+    """Validate the camera part of an add/test/detect request. Returns (fields, error).
+
+    Every camera has two slots: `url` (low quality, used by the grid and
+    thumbnails) and `url_main` (high quality, used by full view). For RTSP the
+    user types them (or Auto-detect fills them); for ONVIF they are resolved
+    from the camera's own profiles, optionally pinned by profile token.
+    """
     ctype = body.get("type")
     f = {"type": ctype, "label": str(body.get("label", "")).strip()[:60]}
     if ctype == "rtsp":
         url = str(body.get("url", "")).strip()
         url_main = str(body.get("url_main", "")).strip()
-        if not _valid_rtsp(url):
-            return None, "Enter a valid rtsp:// address (no spaces)"
-        if url_main and not _valid_rtsp(url_main):
-            return None, "The high-quality address must also be rtsp://"
-        f.update(url=url, url_main=url_main)
+        if not url and not url_main:
+            return None, "Enter at least one rtsp:// address"
+        for u in (url, url_main):
+            if u and not _valid_rtsp(u):
+                return None, "Addresses must be rtsp://… with no spaces"
+        # Only one given: use it for both slots.
+        f.update(url=url or url_main, url_main=url_main or url)
     elif ctype == "onvif":
         host = str(body.get("ip", "")).strip()
         port = str(body.get("port", "80")).strip() or "80"
@@ -2258,10 +2346,31 @@ def _camera_body(body):
         if not port.isdigit() or not (0 < int(port) < 65536):
             return None, "Port must be a number"
         f.update(ip=host, port=int(port), user=str(body.get("user", "")).strip()[:64],
-                 password=str(body.get("password", ""))[:128])
+                 password=str(body.get("password", ""))[:128],
+                 sub_token=str(body.get("sub_token", "")).strip()[:64],
+                 main_token=str(body.get("main_token", "")).strip()[:64])
     else:
         return None, "Unknown camera type"
     return f, None
+
+
+def _fill_saved_password(f, body):
+    """Blank ONVIF password while editing an existing camera = keep the saved one."""
+    if f["type"] == "onvif" and not f["password"]:
+        existing = dvr_config.get_dvrs().get(str(body.get("key", "")).strip().lower(), {})
+        f["password"] = existing.get("password", "")
+
+
+def _resolve_onvif(f):
+    """Ask the camera for its real stream addresses and fill url/url_main.
+    Honour pinned profile tokens; otherwise pick automatically."""
+    profiles = onvif_util.stream_profiles(f["ip"], f["port"], f["user"], f["password"])
+    by_tok = {p["token"]: p for p in profiles}
+    auto_sub, auto_main = onvif_util.pick_streams(profiles)
+    sub = by_tok.get(f.get("sub_token")) or auto_sub
+    main = by_tok.get(f.get("main_token")) or auto_main
+    f.update(url=sub["uri"], url_main=main["uri"], sub_token=sub["token"], main_token=main["token"])
+    return profiles, sub, main
 
 
 def _go2rtc(method, path, timeout=8):
@@ -2270,43 +2379,163 @@ def _go2rtc(method, path, timeout=8):
         return resp.read()
 
 
-@app.route('/api/camera/test', methods=['POST'])
-@require_auth
-def api_camera_test():
-    """Grab one frame before saving, so a typo shows up in the form rather than
-    as a black tile on the TV. go2rtc connects through a temporary stream that
-    is deleted afterwards -- a single short decode, not a lasting cost."""
-    body = request.get_json(force=True) or {}
-    f, err = _camera_body(body)
-    if err:
-        return jsonify({"ok": False, "error": err}), 400
-    if f["type"] == "onvif" and not f["password"]:
-        existing = dvr_config.get_dvrs().get(str(body.get("key", "")).strip().lower(), {})
-        f["password"] = existing.get("password", "")
-    result = {"ok": False}
-    if f["type"] == "onvif":
-        try:
-            info = onvif_util.probe(f["ip"], f["port"], f["user"], f["password"])
-            result.update(ptz=info["ptz"], name=info["name"])
-        except onvif_util.OnvifError as e:
-            return jsonify({"ok": False, "error": f"ONVIF: {e}"})
-    src = dvr_config.source_urls(dict(f, channels=1), 1)[0]
+def _grab_frame(src):
+    """One JPEG from an arbitrary source via a temporary go2rtc stream, which is
+    removed afterwards. A single short decode -- for tests, not for viewing."""
     name = "probe_" + secrets.token_hex(4)
     try:
         _go2rtc("PUT", f"/api/streams?name={name}&src={urllib.parse.quote(src, safe='')}")
-        data = _go2rtc("GET", f"/api/frame.jpeg?src={name}")
-        if data and len(data) > 100:
-            result.update(ok=True, preview="data:image/jpeg;base64," + base64.b64encode(data).decode())
-        else:
-            result["error"] = "Connected, but the camera sent no picture"
-    except Exception as e:
-        result["error"] = "No picture from the camera — check the address and password"
-        print(f"[camera] test failed: {e}")
+        data = _go2rtc("GET", f"/api/frame.jpeg?src={name}", timeout=12)
+        return data if data and len(data) > 100 else None
     finally:
         try:
             _go2rtc("DELETE", f"/api/streams?src={name}", timeout=3)
         except Exception:
             pass
+
+
+def _jpeg_size(b):
+    """(width, height) from a JPEG's SOF header, or (0, 0)."""
+    i = 2
+    while i < len(b) - 9:
+        if b[i] != 0xFF:
+            i += 1
+            continue
+        m = b[i + 1]
+        if m in (0xC0, 0xC1, 0xC2):
+            return int.from_bytes(b[i + 7:i + 9], "big"), int.from_bytes(b[i + 5:i + 7], "big")
+        if m == 0xD8 or 0xD0 <= m <= 0xD7 or m == 0xFF:
+            i += 2 if m != 0xFF else 1
+            continue
+        i += 2 + int.from_bytes(b[i + 2:i + 4], "big")
+    return 0, 0
+
+
+# Main <-> sub naming conventions seen across camera vendors. Auto-detect for
+# plain RTSP tries the counterpart of whatever address the user typed.
+_RTSP_PAIRS = [
+    (r"(/Streaming/Channels/\d+?)01\b", r"\g<1>02"),     # Hikvision 101 <-> 102
+    (r"(/Streaming/Channels/\d+?)02\b", r"\g<1>01"),
+    (r"subtype=0", "subtype=1"), (r"subtype=1", "subtype=0"),   # Dahua / Amcrest
+    (r"/MAIN\b", "/SUB"), (r"/SUB\b", "/MAIN"),
+    (r"/main\b", "/sub"), (r"/sub\b", "/main"),
+    (r"(ch\d+_)0\b", r"\g<1>1"), (r"(ch\d+_)1\b", r"\g<1>0"),
+    (r"stream1\b", "stream2"), (r"stream2\b", "stream1"),
+    (r"/av0_0\b", "/av0_1"), (r"/av0_1\b", "/av0_0"),
+    (r"/h264Preview_(\d+)_main", r"/h264Preview_\1_sub"),    # Reolink
+    (r"/h264Preview_(\d+)_sub", r"/h264Preview_\1_main"),
+]
+
+
+def _rtsp_variants(url):
+    out = []
+    for pat, rep in _RTSP_PAIRS:
+        v = re.sub(pat, rep, url, count=1)
+        if v != url and v not in out:
+            out.append(v)
+    return out
+
+
+_detect_lock = threading.Lock()
+HIGH_PIXELS_WARN = 1920 * 1088
+
+
+def _stream_note(w, h):
+    if w * h > HIGH_PIXELS_WARN:
+        return (f"{w}×{h} is larger than 1080p — this board decodes in software, so full "
+                f"view of this stream will have a low frame rate. Choose the smaller "
+                f"stream for full view if smooth motion matters more than detail.")
+    return ""
+
+
+@app.route('/api/camera/detect', methods=['POST'])
+@require_auth
+def api_camera_detect():
+    """Work out the low/high stream pair.
+
+    ONVIF: the camera lists its profiles; nothing is decoded. Profile URIs stay
+    server-side (they carry credentials) -- the browser only sees tokens.
+    RTSP: try the vendor counterpart of the typed address(es) and measure each
+    candidate's real resolution from one frame. One detection at a time.
+    """
+    body = request.get_json(force=True) or {}
+    f, err = _camera_body(body)
+    if err:
+        return jsonify({"error": err}), 400
+    _fill_saved_password(f, body)
+    if not _detect_lock.acquire(blocking=False):
+        return jsonify({"error": "Detection already running"}), 429
+    try:
+        if f["type"] == "onvif":
+            try:
+                profiles = onvif_util.stream_profiles(f["ip"], f["port"], f["user"], f["password"])
+            except onvif_util.OnvifError as e:
+                return jsonify({"error": f"ONVIF: {e}"})
+            sub, main = onvif_util.pick_streams(profiles)
+            return jsonify({
+                "profiles": [{k: p[k] for k in ("token", "name", "width", "height", "codec")} for p in profiles],
+                "sub_token": sub["token"], "main_token": main["token"],
+                "note": _stream_note(main["width"], main["height"]),
+            })
+
+        seeds = [u for u in (str(body.get("url", "")).strip(), str(body.get("url_main", "")).strip()) if u]
+        cands = []
+        for u in seeds + [v for s in seeds for v in _rtsp_variants(s)]:
+            if u not in cands:
+                cands.append(u)
+        found = []
+        for u in cands[:5]:
+            try:
+                data = _grab_frame(u)
+            except Exception:
+                data = None
+            if data:
+                w, h = _jpeg_size(data)
+                if not any((w, h) == (x["width"], x["height"]) and x["url"] != u for x in found):
+                    found.append({"url": u, "width": w, "height": h})
+        if not found:
+            return jsonify({"error": "No picture from any address — check the address and password"})
+        found.sort(key=lambda x: x["width"] * x["height"])
+        low, high = found[0], found[-1]
+        note = _stream_note(high["width"], high["height"])
+        if low is high:
+            note = ("Only one stream found, so the grid will decode it at full size "
+                    "(more CPU). If the camera has a sub-stream, enter its address as Low.")
+        return jsonify({"streams": found, "url": low["url"], "url_main": high["url"], "note": note})
+    finally:
+        _detect_lock.release()
+
+
+@app.route('/api/camera/test', methods=['POST'])
+@require_auth
+def api_camera_test():
+    """Grab one frame from the low-quality stream before saving, so a typo shows
+    up in the form rather than as a black tile on the TV."""
+    body = request.get_json(force=True) or {}
+    f, err = _camera_body(body)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    _fill_saved_password(f, body)
+    result = {"ok": False}
+    if f["type"] == "onvif":
+        try:
+            info = onvif_util.probe(f["ip"], f["port"], f["user"], f["password"])
+            _, sub, main = _resolve_onvif(f)
+            result.update(ptz=info["ptz"], name=info["name"],
+                          main_size=f"{main['width']}×{main['height']}")
+        except onvif_util.OnvifError as e:
+            return jsonify({"ok": False, "error": f"ONVIF: {e}"})
+    try:
+        data = _grab_frame(f["url"])
+        if data:
+            w, h = _jpeg_size(data)
+            result.update(ok=True, size=f"{w}×{h}",
+                          preview="data:image/jpeg;base64," + base64.b64encode(data).decode())
+        else:
+            result["error"] = "Connected, but the camera sent no picture"
+    except Exception as e:
+        result["error"] = "No picture from the camera — check the address and password"
+        print(f"[camera] test failed: {e}")
     return jsonify(result)
 
 
@@ -2323,9 +2552,15 @@ def api_camera_add():
     f, err = _camera_body(body)
     if err:
         return jsonify({"error": err}), 400
+    _fill_saved_password(f, body)
+    if f["type"] == "onvif":
+        try:
+            _resolve_onvif(f)
+        except onvif_util.OnvifError as e:
+            # Still save: go2rtc's own ONVIF source is the fallback, and the
+            # camera may simply be offline right now.
+            print(f"[camera] {key}: could not resolve ONVIF streams ({e}); using go2rtc fallback")
     ctype, label = f.pop("type"), f.pop("label")
-    if ctype == "onvif" and not f["password"] and existing:
-        f["password"] = existing.get("password", "")    # blank = keep current
     if not dvr_config.add_or_update_camera(key, label, ctype, **f):
         return jsonify({"error": "Failed to save"}), 500
     if ctype == "onvif":

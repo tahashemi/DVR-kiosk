@@ -116,7 +116,11 @@ def source_urls(d, ch):
     if t == "rtsp":
         sub = d.get("url", "")
         return sub, d.get("url_main") or sub
+    if t == "onvif" and d.get("url"):
+        # Real RTSP addresses resolved from the camera's profiles at save time.
+        return d["url"], d.get("url_main") or d["url"]
     if t == "onvif":
+        # Fallback for entries saved before streams were resolved.
         auth = ""
         if d.get("user") or d.get("password"):
             auth = f"{_cred(d.get('user', ''))}:{_cred(d.get('password', ''))}@"
@@ -211,6 +215,9 @@ def add_or_update_camera(key, label, ctype, enabled=True, **fields):
                      port=int(port) if port.isdigit() else 80,
                      user=str(fields.get("user", "")).strip(),
                      password=str(fields.get("password", "")))
+        for k in ("url", "url_main", "sub_token", "main_token"):
+            if fields.get(k):
+                entry[k] = str(fields[k]).strip()
         # Keep PTZ details learned earlier; they are re-probed on demand.
         old = DVRS.get(key, {})
         for k in ("ptz", "ptz_xaddr", "media_xaddr", "profile_token"):

@@ -239,6 +239,81 @@ def probe(host, port, user, password):
             "media_xaddr": media_xaddr, "profile_token": token, "name": name}
 
 
+def _media_xaddr(host, port, user, password):
+    caps = _call(device_xaddr(host, port), user, password,
+                 '<tds:GetCapabilities><tds:Category>Media</tds:Category></tds:GetCapabilities>')
+    for el in caps.iter():
+        if _local(el.tag) == "Media":
+            x = _text(el, "XAddr")
+            if x:
+                return x
+    raise OnvifError("camera has no media service")
+
+
+def _with_credentials(uri, host, user, password):
+    """Cameras return stream URIs without credentials (and sometimes with an
+    internal or wildcard address); make the URI usable as-is by go2rtc."""
+    from urllib.parse import quote, urlsplit as _split, urlunsplit
+    p = _split(uri)
+    hostname = p.hostname or host
+    if hostname in ("0.0.0.0", "127.0.0.1", "localhost"):
+        hostname = host
+    netloc = hostname + (f":{p.port}" if p.port else "")
+    if user and p.username is None:
+        netloc = f"{quote(user, safe='')}:{quote(password or '', safe='')}@{netloc}"
+    elif p.username is not None:
+        netloc = p.netloc
+    return urlunsplit((p.scheme, netloc, p.path, p.query, ""))
+
+
+def stream_profiles(host, port, user, password):
+    """Every media profile with its resolution, codec and real RTSP address.
+
+    Asking the camera for each profile's stream URI is the only reliable way
+    to tell sub from main: profile order and naming vary by vendor, so
+    "profile #2 is the sub-stream" guesses pick the wrong one on many models.
+    Returned URIs contain credentials -- keep them server-side.
+    """
+    media = _media_xaddr(host, port, user, password)
+    root = _call(media, user, password, "<trt:GetProfiles/>")
+    out = []
+    for p in _find_all(root, "Profiles"):
+        token = p.get("token", "")
+        if not token:
+            continue
+        enc = _find(p, "VideoEncoderConfiguration")
+        res = _find(enc, "Resolution") if enc is not None else None
+        w = int(_text(res, "Width") or 0) if res is not None else 0
+        h = int(_text(res, "Height") or 0) if res is not None else 0
+        codec = (_text(enc, "Encoding") if enc is not None else "") or "?"
+        try:
+            r = _call(media, user, password,
+                      '<trt:GetStreamUri><trt:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream>'
+                      '<tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup>'
+                      f'<trt:ProfileToken>{_esc(token)}</trt:ProfileToken></trt:GetStreamUri>')
+            uri = _text(r, "Uri")
+        except OnvifError:
+            uri = ""
+        if not uri.startswith("rtsp"):
+            continue
+        out.append({"token": token, "name": _text(p, "Name") or token, "width": w, "height": h,
+                    "codec": codec.upper(), "uri": _with_credentials(uri, host, user, password)})
+    if not out:
+        raise OnvifError("camera reported no RTSP streams")
+    return out
+
+
+def pick_streams(profiles):
+    """(sub, main) choice. Main = highest resolution. Sub = lowest-resolution
+    H.264 stream, because every grid tile is decoded in software on this board
+    and H.265 costs several times more CPU per pixel."""
+    by_px = sorted(profiles, key=lambda p: p["width"] * p["height"])
+    main = by_px[-1]
+    h264 = [p for p in by_px if "264" in p["codec"]]
+    sub = (h264 or by_px)[0]
+    return sub, main
+
+
 def _clamp(v):
     try:
         return max(-1.0, min(1.0, float(v)))
