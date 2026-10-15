@@ -90,8 +90,15 @@ if [ -d "${SCRIPT_DIR}/src" ]; then
   cp "${SCRIPT_DIR}/Makefile" "${INSTALL_DIR}/"
   cp "${SCRIPT_DIR}/requirements.txt" "${INSTALL_DIR}/"
 else
-  # If running via standalone curl, clone git repo
-  git clone https://github.com/tahashemi/DVR-kiosk.git "${INSTALL_DIR}"
+  # If running via standalone curl, clone git repo -- or refresh it, so a
+  # re-run after a failed install doesn't stop at "already exists".
+  if [ -d "${INSTALL_DIR}/.git" ]; then
+    git -C "${INSTALL_DIR}" fetch --depth 1 origin main
+    git -C "${INSTALL_DIR}" reset --hard FETCH_HEAD
+  else
+    rmdir "${INSTALL_DIR}" 2>/dev/null || true
+    git clone --depth 1 https://github.com/tahashemi/DVR-kiosk.git "${INSTALL_DIR}"
+  fi
 fi
 
 echo -e "${GREEN}[4/8] Compiling Native C Compositor (dvrwall)...${NC}"
