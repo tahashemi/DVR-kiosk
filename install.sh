@@ -106,8 +106,18 @@ chmod +x /usr/local/bin/go2rtc
 
 echo -e "${GREEN}[6/8] Configuring Python Virtual Environment...${NC}"
 python3 -m venv "${INSTALL_DIR}/venv"
-"${INSTALL_DIR}/venv/bin/pip" install --upgrade pip -q
-"${INSTALL_DIR}/venv/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q
+PIP_NET="--retries 10 --timeout 60"
+# Upgrading pip is nice to have, not required.
+"${INSTALL_DIR}/venv/bin/pip" install ${PIP_NET} --upgrade pip -q || true
+if ! "${INSTALL_DIR}/venv/bin/pip" install ${PIP_NET} -r "${INSTALL_DIR}/requirements.txt" -q; then
+  # PyPI unreachable or flaky from this network: use the distro's own
+  # packages instead, seen through the venv.
+  echo -e "${YELLOW}  -> PyPI download failed; using system Python packages instead${NC}"
+  apt-get install -y --no-install-recommends python3-flask python3-waitress python3-bcrypt \
+    python3-cryptography python3-paramiko python3-yaml python3-requests
+  rm -rf "${INSTALL_DIR}/venv"
+  python3 -m venv --system-site-packages "${INSTALL_DIR}/venv"
+fi
 
 echo -e "${GREEN}[7/8] Configuring Authentication & Security...${NC}"
 

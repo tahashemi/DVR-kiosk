@@ -350,42 +350,56 @@ def _write_yaml(streams):
             os.replace(tmp, path)
 
 
+def _sync_once(new):
+    global _applied
+    try:
+        if _applied is None:
+            # go2rtc loaded the yaml we wrote last time.
+            _applied = next((_read_yaml_streams(p) for p in reversed(GO2RTC_YAML_PATHS)
+                             if os.path.exists(p)), {})
+        if _applied != new and not _apply_live(_applied, new):
+            # API down: one restart (it reads the yaml below), no retry loop.
+            _write_yaml(new)
+            subprocess.run(["systemctl", "restart", "go2rtc.service"],
+                           check=False, timeout=20)
+            _applied = dict(new)
+            return
+        # Written last: go2rtc's API edits the yaml itself, in its own
+        # format; ours is the one that should persist.
+        _write_yaml(new)
+    except Exception as e:
+        print(f"[dvr_config] Failed to sync go2rtc: {e}", flush=True)
+
+
 def _sync_worker():
-    global _sync_want, _applied
+    global _sync_want
     while True:
         with _sync_cond:
             while _sync_want is None:
                 _sync_cond.wait()
             new, _sync_want = _sync_want, None
-        try:
-            if _applied is None:
-                # go2rtc loaded the yaml we wrote last time.
-                _applied = next((_read_yaml_streams(p) for p in reversed(GO2RTC_YAML_PATHS)
-                                 if os.path.exists(p)), {})
-            if _applied != new and not _apply_live(_applied, new):
-                # API down: one restart (it reads the yaml below), no retry loop.
-                _write_yaml(new)
-                subprocess.run(["systemctl", "restart", "go2rtc.service"],
-                               check=False, timeout=20)
-                _applied = dict(new)
-                continue
-            # Written last: go2rtc's API edits the yaml itself, in its own
-            # format; ours is the one that should persist.
-            _write_yaml(new)
-        except Exception as e:
-            print(f"[dvr_config] Failed to sync go2rtc: {e}", flush=True)
+        _sync_once(new)
+
+
+# The long-running web app sets this so saves return immediately; short-lived
+# callers (installer, CLI) keep the default and finish the sync before they
+# exit -- a background thread would die with them, leaving the yaml unwritten.
+BACKGROUND_SYNC = False
 
 
 def sync_go2rtc():
     """Write go2rtc.yaml and apply only the changed streams to the running
-    go2rtc through its API, in the background.
+    go2rtc through its API.
 
     It used to restart go2rtc on every save, which dropped every stream on the
     box (not just the edited DVR) and made dvrwall reconnect all of them at
-    once. The newest config always wins: a save made while an older one is
-    still being applied replaces it instead of queueing behind it."""
+    once. In background mode the newest config always wins: a save made while
+    an older one is still being applied replaces it instead of queueing."""
     global _sync_want, _sync_thread
     if os.name == 'nt':
+        return
+    if not BACKGROUND_SYNC:
+        _sync_once(go2rtc_streams())
         return
     with _sync_cond:
         _sync_want = go2rtc_streams()

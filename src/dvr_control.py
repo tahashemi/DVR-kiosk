@@ -16,6 +16,7 @@ from flask import Flask, jsonify, render_template_string, request, Response, mak
 import waitress
 
 import dvr_config
+dvr_config.BACKGROUND_SYNC = True   # saves return at once; see sync_go2rtc()
 import channel_labels
 import profiles
 import schedule
