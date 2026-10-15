@@ -259,34 +259,137 @@ def delete_dvr(dvr_key):
         return True
     return False
 
+GO2RTC_API = "http://127.0.0.1:1984"
+GO2RTC_CALL_TIMEOUT = 2
+
+_sync_cond = threading.Condition()
+_sync_want = None          # newest desired {stream: src}; older ones are dropped
+_sync_thread = None
+
+
+def go2rtc_streams(dvrs=None):
+    """{stream_name: source_url} for every enabled channel."""
+    out = {}
+    for key, d in (DVRS if dvrs is None else dvrs).items():
+        if not d.get("enabled", True):
+            continue
+        for ch in range(1, d.get("channels", 0) + 1):
+            sub, main = source_urls(d, ch)
+            out[f"{key}_ch{ch}"] = sub          # grid & thumbnails
+            out[f"{key}_ch{ch}_main"] = main    # full-screen viewing
+    return out
+
+
+def _read_yaml_streams(path):
+    """Parse the streams this module itself wrote (one JSON value per line)."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("  ") and ": " in line:
+                    name, _, val = line.strip().partition(": ")
+                    try:
+                        out[name] = json.loads(val)
+                    except ValueError:
+                        out[name] = val
+    except OSError:
+        pass
+    return out
+
+
+def _go2rtc_call(method, name, src=None):
+    from urllib.parse import urlencode
+    from urllib.request import Request, urlopen
+    q = {"name": name, "src": src} if method == "PUT" else {"src": name}
+    req = Request(f"{GO2RTC_API}/api/streams?{urlencode(q)}", method=method)
+    with urlopen(req, timeout=GO2RTC_CALL_TIMEOUT):
+        pass
+
+
+GO2RTC_YAML_PATHS = ["/etc/dvr-kiosk/go2rtc.yaml", "/root/go2rtc.yaml"]
+_applied = None            # what the running go2rtc actually has, as far as we know
+
+
+def _apply_live(applied, new):
+    """Push only the differences to the running go2rtc, updating `applied`
+    as each call succeeds. Returns False if the API is unreachable (caller
+    restarts go2rtc once). A call that times out is skipped, not retried; and
+    the batch is abandoned as soon as a newer config arrives."""
+    from urllib.error import URLError
+    changes = [("DELETE", n, None) for n in applied if applied[n] != new.get(n)]
+    changes += [("PUT", n, src) for n, src in new.items() if applied.get(n) != src]
+    failed_first = False
+    for i, (method, name, src) in enumerate(changes):
+        with _sync_cond:
+            if _sync_want is not None:
+                return True        # superseded; the newest config is applied next
+        try:
+            _go2rtc_call(method, name, src)
+        except Exception as e:
+            if isinstance(e, URLError) and i == 1 and failed_first:
+                return False       # first two calls both failed: API is dead or hung
+            failed_first = failed_first or i == 0
+            print(f"[dvr_config] go2rtc {method} {name} skipped: {e}", flush=True)
+            continue
+        if method == "DELETE":
+            applied.pop(name, None)
+        else:
+            applied[name] = src
+    return True
+
+
+def _write_yaml(streams):
+    # JSON string literals are valid YAML double-quoted scalars, so a
+    # user-typed URL can't inject YAML structure.
+    content = "streams:\n" + "".join(f"  {n}: {json.dumps(v)}\n" for n, v in streams.items())
+    for path in GO2RTC_YAML_PATHS:
+        if os.path.exists(os.path.dirname(path)):
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, path)
+
+
+def _sync_worker():
+    global _sync_want, _applied
+    while True:
+        with _sync_cond:
+            while _sync_want is None:
+                _sync_cond.wait()
+            new, _sync_want = _sync_want, None
+        try:
+            if _applied is None:
+                # go2rtc loaded the yaml we wrote last time.
+                _applied = next((_read_yaml_streams(p) for p in reversed(GO2RTC_YAML_PATHS)
+                                 if os.path.exists(p)), {})
+            if _applied != new and not _apply_live(_applied, new):
+                # API down: one restart (it reads the yaml below), no retry loop.
+                _write_yaml(new)
+                subprocess.run(["systemctl", "restart", "go2rtc.service"],
+                               check=False, timeout=20)
+                _applied = dict(new)
+                continue
+            # Written last: go2rtc's API edits the yaml itself, in its own
+            # format; ours is the one that should persist.
+            _write_yaml(new)
+        except Exception as e:
+            print(f"[dvr_config] Failed to sync go2rtc: {e}", flush=True)
+
+
 def sync_go2rtc():
-    """Generates /etc/dvr-kiosk/go2rtc.yaml (and /root/go2rtc.yaml) for all enabled DVRs."""
-    yaml_paths = ["/etc/dvr-kiosk/go2rtc.yaml", "/root/go2rtc.yaml"]
+    """Write go2rtc.yaml and apply only the changed streams to the running
+    go2rtc through its API, in the background.
+
+    It used to restart go2rtc on every save, which dropped every stream on the
+    box (not just the edited DVR) and made dvrwall reconnect all of them at
+    once. The newest config always wins: a save made while an older one is
+    still being applied replaces it instead of queueing behind it."""
+    global _sync_want, _sync_thread
     if os.name == 'nt':
         return
-    try:
-        lines = ["streams:"]
-        for key, d in DVRS.items():
-            if not d.get("enabled", True):
-                continue
-            for ch in range(1, d.get("channels", 0) + 1):
-                sub, main = source_urls(d, ch)
-                # JSON string literals are valid YAML double-quoted scalars, so
-                # a user-typed URL can't inject YAML structure.
-                # Substream for kiosk grid & thumbnails
-                lines.append(f"  {key}_ch{ch}: {json.dumps(sub)}")
-                # Mainstream for full-screen viewing
-                lines.append(f"  {key}_ch{ch}_main: {json.dumps(main)}")
-
-        yaml_content = "\n".join(lines) + "\n"
-        for path in yaml_paths:
-            parent = os.path.dirname(path)
-            if os.path.exists(parent):
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(yaml_content)
-        
-        # Restart or reload go2rtc
-        subprocess.run(["systemctl", "restart", "go2rtc.service"], check=False)
-    except Exception as e:
-        print(f"[dvr_config] Failed to sync go2rtc: {e}")
-
+    with _sync_cond:
+        _sync_want = go2rtc_streams()
+        if _sync_thread is None:
+            _sync_thread = threading.Thread(target=_sync_worker, daemon=True, name="go2rtc-sync")
+            _sync_thread.start()
+        _sync_cond.notify()
