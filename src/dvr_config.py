@@ -53,6 +53,18 @@ def load_dvrs():
     # Return default clone
     return {k: dict(v) for k, v in DEFAULT_DVRS.items()}
 
+def _read_raw(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def get_setting(name, default=None):
+    """Optional top-level setting in dvr_config.json, beside "dvrs"."""
+    return _read_raw(_get_config_path()).get(name, default)
+
 def save_dvrs(dvrs_dict):
     path = _get_config_path()
     with _lock:
@@ -61,8 +73,11 @@ def save_dvrs(dvrs_dict):
             # Write-then-rename so a crash mid-save can never leave a truncated
             # config (which would silently fall back to DEFAULT_DVRS).
             tmp = path + ".tmp"
+            # Keep other top-level settings (e.g. snapshot_workers).
+            data = _read_raw(path)
+            data["dvrs"] = dvrs_dict
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"dvrs": dvrs_dict}, f, indent=2)
+                json.dump(data, f, indent=2)
             os.replace(tmp, path)
             sync_go2rtc()
             return True

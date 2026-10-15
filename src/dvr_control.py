@@ -22,6 +22,7 @@ import schedule
 import wall
 import set_password
 import onvif_util
+import frame_fallback
 from ptz_ui import PTZ_CSS, PTZ_JS
 from wall_page import WALL_HTML
 
@@ -551,6 +552,8 @@ def cpu_load_governor():
 
 def start_background_workers():
     threading.Thread(target=grid_watchdog, daemon=True).start()
+    frame_fallback.set_override(dvr_config.get_setting("snapshot_workers"))
+    frame_fallback.start_reaper()
     threading.Thread(target=sync_power_schedule, daemon=True).start()
     threading.Thread(target=cpu_load_governor, daemon=True).start()
 
@@ -2777,6 +2780,28 @@ def snapshot_ttl():
     return min(SNAPSHOT_TTL_SEC, max(0.3, 1.0 / fps))
 
 
+def _wall_handles(stream):
+    """True if dvrwall has this stream in its roster (connected or connecting)."""
+    raw = wall_status_cache
+    if not isinstance(raw, dict):
+        return False
+    for s in raw.get("streams", []):
+        name = s.get("name") or s.get("url", "").rsplit("/", 1)[-1]
+        if name == stream:
+            return True
+    return False
+
+
+def _bounded_go2rtc_frame(dvr_key, ch):
+    name = dvr_config.stream_name(dvr_key, ch, mainstream=False)
+    key = f"{dvr_key}:{ch}"
+    if _wall_handles(name):
+        return frame_fallback.cached(key)
+    d = dvr_config.DVRS.get(dvr_key, {})
+    url = f"http://127.0.0.1:{GO2RTC_HTTP_PORT}/api/frame.jpeg?src={name}"
+    return frame_fallback.fetch(key, url, remote=frame_fallback.is_remote(d.get("ip", "")))
+
+
 @app.route('/api/snapshot/<dvr_key>/<int:ch>')
 @app.route('/api/snapshot/<dvr_key>/<int:ch>.jpg')
 @require_auth
@@ -2813,17 +2838,14 @@ def api_snapshot(dvr_key, ch):
         except Exception:
             pass
 
-    # 2. Fallback: go2rtc frame API (for pool channels not currently in kiosk grid)
-    try:
-        req = urllib.request.Request(f"http://127.0.0.1:{GO2RTC_HTTP_PORT}/api/frame.jpeg?src={name}")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = resp.read()
-        if data and len(data) > 100:
-            with _CACHE_LOCK:
-                _SNAPSHOT_CACHE[key] = (data, now)
-            return Response(data, mimetype="image/jpeg")
-    except Exception:
-        pass
+    # 2. Fallback: go2rtc frame API, bounded (see frame_fallback.py). Only for
+    #    channels dvrwall isn't handling -- if it is, its own frame is coming
+    #    and a second decode would just duplicate the upstream connection.
+    data = _bounded_go2rtc_frame(dvr_key, ch)
+    if data:
+        with _CACHE_LOCK:
+            _SNAPSHOT_CACHE[key] = (data, now)
+        return Response(data, mimetype="image/jpeg")
 
     # 3. Last resort fallback: return last known cached snapshot even if slightly older than TTL
     with _CACHE_LOCK:
@@ -2900,16 +2922,14 @@ def api_stream_main_jpg(dvr_key, ch):
     except Exception:
         pass
 
-    # 3. Fallback: go2rtc frame API
-    try:
-        req = urllib.request.Request(f"http://127.0.0.1:{GO2RTC_HTTP_PORT}/api/frame.jpeg?src={stream_id}")
-        with urllib.request.urlopen(req, timeout=3) as upstream:
-            data = upstream.read()
+    # 3. Fallback: a bounded go2rtc decode of the substream. Never the
+    #    mainstream: a 4 MP decoder costs 50-70 MB, too much for a fallback.
+    data = _bounded_go2rtc_frame(dvr_key, ch)
+    if data:
         resp = Response(data, mimetype='image/jpeg')
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return resp
-    except Exception as e:
-        return str(e), 502
+    return "stream not ready", 503
 
 
 @app.route('/api/live/<dvr_key>/<int:ch>')
