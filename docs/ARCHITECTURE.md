@@ -59,6 +59,18 @@ The system consists of three decoupled daemon processes communicating over local
   - Skips `sws_scale` (YUV420P $\rightarrow$ BGRA conversion) based on `GLOBAL_SCALE_STRIDE` (`1-of-1`, `1-of-2`, `1-of-4`, `1-of-8`).
   - Saves $\sim 45\%$ per-frame compute cost on low-power ARM cores under heavy load.
 - **Zero-Churn Layout Switching**: Layout changes and fullscreen toggles modify compositor blit pointers in $<1\text{ms}$ without destroying and reconnecting RTSP decoder threads.
+- **Hardware decoding with automatic fallback** (`src/hwdec.c`): packets are still read with libavformat; only the decode step is swappable. In `auto` mode each stream tries, in order:
+
+  | Backend | Uses | Typical boards |
+  | :--- | :--- | :--- |
+  | `gst-v4l2sl` | GStreamer `v4l2slh264dec` / `v4l2slh265dec` (stateless V4L2) | Allwinner H3/H5/H6/H616 (cedrus), mainline Rockchip, NXP |
+  | `gst-nv` | GStreamer `nvv4l2decoder` | NVIDIA Jetson |
+  | `v4l2m2m` | FFmpeg `h264_v4l2m2m` (stateful V4L2) | Raspberry Pi 2-4, Amlogic, Qualcomm |
+  | `rkmpp` | FFmpeg `h264_rkmpp` (if the FFmpeg build has it) | Rockchip vendor kernels |
+  | `vaapi` / `cuda` | FFmpeg hwaccels | Intel/AMD and NVIDIA PCs |
+  | `software` | libavcodec | everything (Raspberry Pi 5 has no H.264 block) |
+
+  Mainline FFmpeg cannot drive stateless decoders, which is why that path goes through GStreamer. A backend is skipped without trying when the stream is larger than it supports (1080p default for SBC decoders, `--hw-max-pixels`), when it isn't installed, or after repeated failures. A hardware decoder that errors, falls behind the stream, or goes silent hands its stream to software in place (no reconnect) and is retried for that stream after 5 minutes. Allwinner's tiled `NV12_32L32` output is untiled before scaling. Policy: `--decoder`, the `DECODER` socket command, or `"decoder"` in `dvr_config.json`; `--hw-max-streams` caps concurrent hardware sessions; `dvrwall --selftest` lists what a machine has. `STATUS` reports each stream's decoder.
 
 ### 2.2 `go2rtc` Stream Gateway
 - Handles camera manufacturer protocols (DVRIP, Hikvision, Dahua, RTSP).
@@ -88,6 +100,7 @@ The system consists of three decoupled daemon processes communicating over local
 | `STRIDE` | `<1\|2\|4\|8>` | Set post-decode scale-skip stride. |
 | `FPS` | `<fps>` | Set compositor target display framerate. |
 | `JPEGFPS` | `<thumb> <main>` | Set thumbnail and mainstream JPEG cache rate. |
+| `DECODER` | `<auto\|software\|backend>` | Decoder policy for streams opened from now on. |
 | `STATUS` | None | Return real-time JSON status of all streams. |
 | `CLEAR` | None | Blank TV display while keeping decoders warm. |
 | `STOP` | None | Stop all decoder streams. |

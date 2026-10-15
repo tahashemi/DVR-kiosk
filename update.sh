@@ -3,13 +3,14 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/tahashemi/DVR-kiosk/main/update.sh | sudo bash
 #
-# Updates only the Python application code, wherever the running dvr-kiosk
+# Updates the Python application code, wherever the running dvr-kiosk
 # service actually loads it from (found from the service unit, so it works for
-# both the standard /opt/dvr-kiosk install and older hand-built layouts).
+# both the standard /opt/dvr-kiosk install and older hand-built layouts), and
+# rebuilds the dvrwall compositor on this machine when its C sources changed.
 #
 # It never touches: configuration or data files (*.json, go2rtc.yaml),
-# credentials, systemd units, go2rtc, or the dvrwall binary. Those are site
-# state, not code. For a full (re)install use install.sh.
+# credentials, systemd units, or go2rtc. Those are site state, not code. For a
+# full (re)install use install.sh.
 #
 # Safety: every replaced file is backed up first; the new code is syntax-
 # checked on this machine's interpreter before anything is swapped in; and if
@@ -58,6 +59,77 @@ for p in sorted(pathlib.Path(sys.argv[1]).glob("*.py")):
     ast.parse(p.read_text(encoding="utf-8"), str(p))
 print("[update] syntax ok")
 EOF
+
+# ---- dvrwall (C compositor): rebuild only when its sources changed ----
+# Built natively on this machine, so it works on any CPU without
+# cross-compiling. The new binary must pass --selftest before it is swapped
+# in, and the old one comes back if the wall isn't healthy afterwards.
+WALL_SERVICE="dvrwall.service"
+STAMP_DIR=/var/lib/dvr-kiosk
+update_dvrwall() {
+  systemctl cat "$WALL_SERVICE" >/dev/null 2>&1 || { say "no $WALL_SERVICE here -- skipping dvrwall"; return 0; }
+  local bin src_sum old_sum
+  bin=$(systemctl show -p ExecStart --value "$WALL_SERVICE" | sed -n 's/.*argv\[\]=\([^ ;]*\).*/\1/p')
+  [ -n "$bin" ] || bin=/usr/local/bin/dvrwall
+  src_sum=$(cat "$TMP/Makefile" "$TMP"/src/*.c "$TMP"/src/*.h | sha256sum | cut -d' ' -f1)
+  old_sum=$(cat "$STAMP_DIR/dvrwall.src.sha256" 2>/dev/null || true)
+  if [ "$src_sum" = "$old_sum" ] && [ -x "$bin" ]; then
+    say "dvrwall already up to date"
+    return 0
+  fi
+
+  if command -v apt-get >/dev/null; then
+    local need=()
+    for p in gcc make pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev; do
+      dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
+    done
+    if [ ${#need[@]} -gt 0 ]; then
+      say "installing build tools: ${need[*]}"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${need[@]}" >/dev/null \
+        || { say "could not install build tools -- dvrwall left as is"; return 0; }
+    fi
+    # Hardware decoding through GStreamer is optional: if these aren't
+    # available on this distro, dvrwall still builds without them.
+    need=()
+    for p in libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-bad; do
+      dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
+    done
+    if [ ${#need[@]} -gt 0 ]; then
+      say "installing hardware-decoding support: ${need[*]}"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${need[@]}" >/dev/null \
+        || say "GStreamer not available -- building without it"
+    fi
+  fi
+
+  say "building dvrwall ..."
+  if ! make -C "$TMP" >"$TMP/build.log" 2>&1; then
+    tail -20 "$TMP/build.log" >&2
+    say "dvrwall build failed -- the running wall was not touched"
+    return 0
+  fi
+  "$TMP/bin/dvrwall" --selftest || { say "new dvrwall failed its self-test -- not installed"; return 0; }
+
+  cp -p "$bin" "$bin.prev" 2>/dev/null || true
+  install -m 0755 "$TMP/bin/dvrwall" "$bin.new"
+  mv -f "$bin.new" "$bin"
+  say "restarting $WALL_SERVICE ..."
+  systemctl restart "$WALL_SERVICE"
+  for _ in $(seq 1 15); do
+    sleep 1
+    if systemctl is-active --quiet "$WALL_SERVICE" &&
+       "$PY" -c "import socket; s=socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect('/run/dvrwall.sock'); s.sendall(b'STATUS'); s.shutdown(1); assert s.recv(16)" 2>/dev/null; then
+      mkdir -p "$STAMP_DIR"
+      echo "$src_sum" > "$STAMP_DIR/dvrwall.src.sha256"
+      say "dvrwall updated (previous binary kept as $bin.prev)"
+      return 0
+    fi
+  done
+  echo -e "\033[0;31m[update] new dvrwall did not come up -- restoring the previous one\033[0m" >&2
+  if [ -f "$bin.prev" ]; then mv -f "$bin.prev" "$bin"; fi
+  systemctl restart "$WALL_SERVICE"
+  return 0
+}
+update_dvrwall
 
 # ---- anything to do? ----
 CHANGED=()

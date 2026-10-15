@@ -237,6 +237,17 @@ def dvr_reachable(dvr_key):
     return ok
 
 
+def apply_decoder_setting():
+    """Optional "decoder" in dvr_config.json: auto (default), software, or one
+    backend name (see hwdec.h). dvrwall applies it to streams opened after."""
+    policy = dvr_config.get_setting("decoder")
+    if policy:
+        try:
+            wall.set_decoder(str(policy))
+        except wall.WallError as e:
+            print(f"decoder setting: {e}", flush=True)
+
+
 def grid_watchdog():
     global wall_status_cache
     wall_was_down = False
@@ -255,6 +266,7 @@ def grid_watchdog():
             if wall_was_down:
                 wall_was_down = False
                 print("grid_watchdog: dvrwall reconnected, reasserting state", flush=True)
+                apply_decoder_setting()
                 if current_mode == "grid":
                     threading.Thread(target=launch_grid).start()
                 elif current_mode == "fullscreen" and fullscreen_target:
@@ -404,6 +416,7 @@ def stream_health():
             "connected": bool(st.get("connected")),
             "have_frame": bool(st.get("have_frame")),
             "age_ms": int(st.get("age_ms", -1)),
+            "decoder": st.get("decoder", ""),
         }
     return res
 
@@ -551,6 +564,7 @@ def cpu_load_governor():
 
 
 def start_background_workers():
+    apply_decoder_setting()
     threading.Thread(target=grid_watchdog, daemon=True).start()
     frame_fallback.set_override(dvr_config.get_setting("snapshot_workers"))
     frame_fallback.start_reaper()
@@ -1104,7 +1118,8 @@ function getTileStatus(dvr, ch) {
     return { cls: 'offline', title: 'DVR Unreachable / Offline', online: false };
   }
   if (isDecoding) {
-    return { cls: 'online', title: 'Live on TV (' + streamInfo.age_ms + 'ms)', online: true, liveTv: true };
+    const dec = streamInfo.decoder ? (streamInfo.decoder === 'software' ? ', software decode' : ', hardware decode: ' + streamInfo.decoder) : '';
+    return { cls: 'online', title: 'Live on TV (' + streamInfo.age_ms + 'ms' + dec + ')', online: true, liveTv: true };
   }
   return { cls: 'online', title: 'Ready (On-Demand)', online: true, liveTv: false };
 }

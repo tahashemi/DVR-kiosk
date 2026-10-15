@@ -132,6 +132,11 @@ def blank():
     return _send("BLANK", timeout=SET_CHANNELS_TIMEOUT)
 
 
+def set_decoder(policy):
+    """Decoder policy for newly opened streams: auto, software, or a backend."""
+    return _send(f"DECODER {policy}")
+
+
 def status():
     try:
         return json.loads(_send("STATUS"))

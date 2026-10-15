@@ -13,6 +13,7 @@ Combines an ultra-efficient C-based HDMI video wall compositor (`dvrwall`) with 
 ## 🌟 Key Features
 
 - 🖥️ **Hardware-Accelerated 16-Tile Wall**: Custom C/libavcodec compositor rendering directly to `/dev/fb0` with sub-25ms latency.
+- ⚡ **Hardware Video Decoding**: Uses the board's video decoder when it has one (Allwinner, Rockchip, Raspberry Pi 2-4, Amlogic, Jetson, Intel/AMD/NVIDIA PCs) and falls back to software per stream automatically.
 - ⚡ **Dynamic Post-Decode Scale-Skip Governor**:
   - Decode pipeline maintains 100% P-frame DPB reference integrity (0% video glitches).
   - Skips CPU-intensive `sws_scale` color conversions under load (`1-of-2`, `1-of-4`, `1-of-8` stride), saving up to 60% CPU on low-power ARM cores.
@@ -52,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/tahashemi/DVR-kiosk/main/install.sh
 
 ---
 
-## 🔄 Updating (1-Line, Code Only)
+## 🔄 Updating (1-Line)
 
 Pull the latest application code from GitHub onto an installed device:
 
@@ -60,7 +61,7 @@ Pull the latest application code from GitHub onto an installed device:
 curl -fsSL https://raw.githubusercontent.com/tahashemi/DVR-kiosk/main/update.sh | sudo bash
 ```
 
-It finds where the running service loads its code from, syntax-checks the new version before swapping anything, backs up every replaced file, and rolls back automatically if the service doesn't come back healthy. It never touches configuration, credentials, go2rtc or systemd units. `BRANCH=dev` selects another branch.
+It finds where the running service loads its code from, syntax-checks the new version before swapping anything, backs up every replaced file, and rolls back automatically if the service doesn't come back healthy. When the compositor's C sources changed it also rebuilds `dvrwall` on the device, self-tests it, and restores the previous binary if the wall doesn't come back. It never touches configuration, credentials, go2rtc or systemd units. `BRANCH=dev` selects another branch.
 
 ---
 

@@ -62,6 +62,11 @@ apt-get install -y --no-install-recommends \
   libavcodec-dev \
   libavutil-dev \
   libswscale-dev \
+  pkg-config \
+  libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev \
+  gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-bad \
   python3 \
   python3-pip \
   python3-venv \

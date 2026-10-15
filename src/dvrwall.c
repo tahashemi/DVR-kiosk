@@ -56,6 +56,8 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 
+#include "hwdec.h"
+
 #define MAX_STREAMS 40
 #define URL_MAX 512
 #define NAME_MAX_LEN 96
@@ -66,6 +68,9 @@
 #define THUMB_H 180
 #define HTTP_PORT 8590
 #define DEMAND_WINDOW_MS 3000   /* stop encoding a channel this long after its last request */
+#define HW_STALL_MS 5000        /* hardware decoder fed but silent this long = broken */
+#define HW_FIRST_FRAME_MS 15000 /* ...but allow a long GOP before the first frame */
+#define HW_RETRY_MS 300000      /* after a hardware failure, use software this long */
 
 /* ---------------------------------------------------------------- logging */
 
@@ -217,6 +222,9 @@ struct stream {
      * fullscreen can keep the grid connected-but-idle and resume it
      * instantly on exit. */
     volatile int paused;
+
+    const char *decoder;       /* backend in use, for STATUS ("software", ...) */
+    int64_t hw_retry_ms;       /* no hardware decoding for this stream before this */
 };
 
 static struct stream STREAMS[MAX_STREAMS];
@@ -304,9 +312,10 @@ static void open_gate_release(void) {
 /* One decode session. Returns when the stream dies so the caller can retry. */
 static void stream_session(struct stream *s) {
     AVFormatContext *fmt = NULL;
-    AVCodecContext *dec = NULL;
+    struct vdec *dec = NULL;
     struct SwsContext *sws = NULL;
-    AVFrame *frame = NULL;
+    int sws_w = 0, sws_h = 0;
+    enum AVPixelFormat sws_fmt = AV_PIX_FMT_NONE;
     AVPacket *pkt = NULL;
     int vstream = -1;
     int gate_held = 0;
@@ -339,43 +348,39 @@ static void stream_session(struct stream *s) {
     if (vstream < 0) goto done;
 
     AVCodecParameters *par = fmt->streams[vstream]->codecpar;
-    const AVCodec *codec = avcodec_find_decoder(par->codec_id);
-    if (!codec) goto done;
-    dec = avcodec_alloc_context3(codec);
-    if (!dec || avcodec_parameters_to_context(dec, par) < 0) goto done;
     /* Grid substreams are tiny (CIF-ish) -- one thread is plenty and extra
      * threads just add overhead. A "_main" fullscreen stream is full
      * resolution and is the only thing being decoded while fullscreen is
      * active (see dvr_control.py's launch_fullscreen), so it can use extra
-     * decode threads -- but ONLY slice-threading (FF_THREAD_SLICE), never
-     * frame-threading. FFmpeg's default with thread_count>1 is to also
-     * allow frame-threading, which decodes N whole frames in a pipeline and
-     * only emits the first one after all N are done -- exactly backwards
-     * for live video, and most consumer DVRs encode single-slice frames
-     * anyway (so slice-threading buys nothing here and just adds thread
-     * overhead). This was silently turning fullscreen into a growing,
-     * multi-second backlog under load, observed live via STATUS: frame age
-     * climbing from tens of ms to 9+ seconds before snapping back once the
-     * backlog drained. */
-    dec->thread_count = (s->slot_w > THUMB_W) ? 2 : 1;
-    dec->thread_type = FF_THREAD_SLICE;
-    dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
-    if (avcodec_open2(dec, codec, NULL) < 0) goto done;
+     * decode threads -- but ONLY slice-threading, never frame-threading
+     * (hwdec.c sets that). Frame-threading decodes N whole frames in a
+     * pipeline and only emits the first once all N are done -- exactly
+     * backwards for live video; it was silently turning fullscreen into a
+     * growing, multi-second backlog under load, observed live via STATUS:
+     * frame age climbing from tens of ms to 9+ seconds.
+     *
+     * The decoder itself may be hardware (see hwdec.h); if hardware failed
+     * for this stream recently, software is used until hw_retry_ms. */
+    int threads = is_main ? 2 : 1;
+    dec = vdec_open(par, threads, now_ms() >= s->hw_retry_ms);
+    if (!dec) goto done;
+    s->decoder = vdec_name(dec);
 
     open_gate_release();
     gate_held = 0;
 
-    frame = av_frame_alloc();
     pkt = av_packet_alloc();
-    if (!frame || !pkt) goto done;
+    if (!pkt) goto done;
 
     int sw = s->slot_w, sh = s->slot_h;
     int stride = sw * 4;
 
     s->connected = 1;
-    logmsg("stream[%s]: connected", s->name);
+    logmsg("stream[%s]: connected, decoder %s", s->name, s->decoder);
 
     int was_paused = 0;
+    int64_t last_out_ms = now_ms();    /* hardware stall detection */
+    int got_first = 0;
     while (RUN && s->running) {
         int r = av_read_frame(fmt, pkt);
         if (r < 0) break;
@@ -395,26 +400,34 @@ static void stream_session(struct stream *s) {
         }
         if (was_paused) {
             was_paused = 0;
-            avcodec_flush_buffers(dec);
+            vdec_flush(dec);
+            last_out_ms = now_ms();
+            got_first = 0;
         }
 
-        r = avcodec_send_packet(dec, pkt);
+        r = vdec_send(dec, pkt);
         av_packet_unref(pkt);
-        if (r < 0 && r != AVERROR(EAGAIN)) continue;
 
-        while (avcodec_receive_frame(dec, frame) == 0) {
+        struct vframe frame;
+        int got;
+        while (r >= 0 && (got = vdec_receive(dec, &frame)) != 0) {
+            if (got < 0) { r = -1; break; }
+            last_out_ms = now_ms();
+            got_first = 1;
             s->decode_seq++;
             int cur_stride = GLOBAL_SCALE_STRIDE;
-            if (cur_stride > 1 && (s->decode_seq % (unsigned)cur_stride) != 0) {
-                av_frame_unref(frame);
+            if (cur_stride > 1 && (s->decode_seq % (unsigned)cur_stride) != 0)
                 continue; /* Decode is intact (P-frame reference buffer maintained), but sws_scale is skipped! */
-            }
 
-            if (!sws) {
-                sws = sws_getContext(dec->width, dec->height, dec->pix_fmt,
+            /* Rebuilt when the frame shape changes -- e.g. after falling
+             * back from a hardware decoder (NV12) to software (YUV420P). */
+            if (!sws || frame.w != sws_w || frame.h != sws_h || frame.fmt != sws_fmt) {
+                if (sws) sws_freeContext(sws);
+                sws = sws_getContext(frame.w, frame.h, frame.fmt,
                                      sw, sh, AV_PIX_FMT_BGRA,
                                      SWS_FAST_BILINEAR, NULL, NULL, NULL);
-                if (!sws) { av_frame_unref(frame); goto done; }
+                if (!sws) goto done;
+                sws_w = frame.w; sws_h = frame.h; sws_fmt = frame.fmt;
             }
 
             /* Mainstream-only load shedding: the DVR's mainstream runs at its
@@ -433,7 +446,7 @@ static void stream_session(struct stream *s) {
                 pthread_mutex_lock(&s->lock);
                 int behind = s->have_frame && s->seq != s->consumed_seq;
                 pthread_mutex_unlock(&s->lock);
-                if (behind) { av_frame_unref(frame); continue; }
+                if (behind) continue;
             }
 
             pthread_mutex_lock(&s->lock);
@@ -442,8 +455,8 @@ static void stream_session(struct stream *s) {
 
             uint8_t *dst_data[4]     = { back, NULL, NULL, NULL };
             int      dst_linesize[4] = { stride, 0, 0, 0 };
-            sws_scale(sws, (const uint8_t *const *)frame->data, frame->linesize,
-                      0, dec->height, dst_data, dst_linesize);
+            sws_scale(sws, (const uint8_t *const *)frame.data, frame.linesize,
+                      0, frame.h, dst_data, dst_linesize);
 
             /* Publish by swapping front/back -- no frame data is copied
              * here, sws_scale already wrote straight into `back`. This
@@ -457,7 +470,23 @@ static void stream_session(struct stream *s) {
             s->frames++;
             s->seq++;
             pthread_mutex_unlock(&s->lock);
-            av_frame_unref(frame);
+        }
+
+        /* A hardware decoder that errors, or is fed but stays silent, hands
+         * the stream to software in place -- no reconnect. Software resyncs
+         * on the next keyframe; nothing is skipped in front of it. */
+        if (vdec_is_hw(dec) && (r < 0 ||
+                now_ms() - last_out_ms > (got_first ? HW_STALL_MS : HW_FIRST_FRAME_MS))) {
+            logmsg("stream[%s]: %s decoder failed, switching to software", s->name, s->decoder);
+            s->hw_retry_ms = now_ms() + HW_RETRY_MS;
+            vdec_close(&dec);
+            dec = vdec_open(par, threads, 0);
+            if (!dec) goto done;
+            s->decoder = vdec_name(dec);
+            last_out_ms = now_ms();
+            got_first = 0;
+        } else if (r < 0) {
+            break;
         }
     }
 
@@ -469,8 +498,7 @@ done:
     s->connected = 0;
     if (sws) sws_freeContext(sws);
     if (pkt) av_packet_free(&pkt);
-    if (frame) av_frame_free(&frame);
-    if (dec) avcodec_free_context(&dec);
+    if (dec) vdec_close(&dec);
     if (fmt) avformat_close_input(&fmt);
     av_dict_free(&opts);
 }
@@ -883,6 +911,13 @@ static void handle_cmd(int fd, char *line) {
         }
         dprintf(fd, "OK %d\n", GLOBAL_SCALE_STRIDE);
 
+    } else if (strcmp(cmd, "DECODER") == 0) {
+        /* Decoder policy for streams opened from now on: auto, software, or
+         * one backend name (see hwdec.h). Running streams keep theirs. */
+        char *v = strtok(NULL, " \t\r\n");
+        if (v) hwdec_set_policy(v);
+        dprintf(fd, "OK %s\n", hwdec_policy());
+
     } else if (strcmp(cmd, "JPEGFPS") == 0) {
         /* Runtime WebUI-preview JPEG rate, independent of TARGET_FPS/the TV
          * compositor -- see MJPEG_FPS_THUMB/_MAIN's declaration comment. */
@@ -895,8 +930,8 @@ static void handle_cmd(int fd, char *line) {
     } else if (strcmp(cmd, "STATUS") == 0) {
         int64_t t = now_ms();
         pthread_mutex_lock(&ROSTER_LOCK);
-        dprintf(fd, "{\"blanked\":%d,\"fps\":%d,\"stride\":%d,\"jpeg_fps_thumb\":%d,\"jpeg_fps_main\":%d,\"streams\":[",
-                BLANKED ? 1 : 0, TARGET_FPS, GLOBAL_SCALE_STRIDE, MJPEG_FPS_THUMB, MJPEG_FPS_MAIN);
+        dprintf(fd, "{\"blanked\":%d,\"fps\":%d,\"stride\":%d,\"jpeg_fps_thumb\":%d,\"jpeg_fps_main\":%d,\"decoder_policy\":\"%s\",\"streams\":[",
+                BLANKED ? 1 : 0, TARGET_FPS, GLOBAL_SCALE_STRIDE, MJPEG_FPS_THUMB, MJPEG_FPS_MAIN, hwdec_policy());
         int first = 1;
         for (int i = 0; i < MAX_STREAMS; i++) {
             struct stream *s = &STREAMS[i];
@@ -910,9 +945,10 @@ static void handle_cmd(int fd, char *line) {
             dprintf(fd,
                     "%s{\"url\":\"%s\",\"name\":\"%s\",\"connected\":%d,"
                     "\"paused\":%d,\"have_frame\":%d,\"age_ms\":%lld,"
-                    "\"frames\":%lld}",
+                    "\"frames\":%lld,\"decoder\":\"%s\"}",
                     first ? "" : ",", s->url, s->name, s->connected ? 1 : 0,
-                    s->paused ? 1 : 0, hf, (long long)age, (long long)frames);
+                    s->paused ? 1 : 0, hf, (long long)age, (long long)frames,
+                    s->connected && s->decoder ? s->decoder : "");
             first = 0;
         }
         dprintf(fd, "]}\n");
@@ -1329,6 +1365,19 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) TARGET_FPS = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--decoder") == 0 && i + 1 < argc) hwdec_set_policy(argv[++i]);
+        else if (strcmp(argv[i], "--hw-max-pixels") == 0 && i + 1 < argc) hwdec_set_max_pixels(atol(argv[++i]));
+        else if (strcmp(argv[i], "--hw-max-streams") == 0 && i + 1 < argc) hwdec_set_max_sessions(atoi(argv[++i]));
+    }
+    hwdec_init();
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--selftest") == 0) {
+            /* Used by update.sh before swapping a new build in: proves the
+             * binary links and runs on this machine, and lists decoders. */
+            hwdec_report();
+            printf("dvrwall selftest ok\n");
+            return 0;
+        }
     }
 
     avformat_network_init();
