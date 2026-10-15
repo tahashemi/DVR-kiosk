@@ -252,11 +252,21 @@ def grid_watchdog():
     global wall_status_cache
     wall_was_down = False
     last_roster_refresh = 0.0
+    wall_identity = wall.instance_id()
     while True:
         try:
             st = wall.status()
         except Exception:
             st = None
+
+        # A restart faster than this 10s poll (update.sh, a crash-restart)
+        # never looks "down", but it still comes back with an empty layout
+        # and a black TV. dvrwall recreates its socket on every start, so a
+        # new socket identity means "restarted" even if it never went away.
+        ident = wall.instance_id()
+        if ident != wall_identity:
+            wall_identity = ident
+            wall_was_down = True
 
         if st is None:
             wall_was_down = True

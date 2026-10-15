@@ -5,6 +5,7 @@ fullscreen is a socket write rather than a teardown-and-rebuild -- the old
 ffmpeg approach re-paid ~130s of sequential connect cost on every change.
 """
 import json
+import os
 import socket
 
 SOCK_PATH = "/run/dvrwall.sock"
@@ -130,6 +131,15 @@ def stop():
 def blank():
     """Full teardown plus display standby (FB_BLANK_POWERDOWN)."""
     return _send("BLANK", timeout=SET_CHANNELS_TIMEOUT)
+
+
+def instance_id():
+    """Changes every time dvrwall starts (it recreates its socket), or None."""
+    try:
+        st = os.stat(SOCK_PATH)
+        return (st.st_ino, st.st_ctime_ns)
+    except OSError:
+        return None
 
 
 def set_decoder(policy):
