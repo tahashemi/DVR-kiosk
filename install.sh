@@ -113,10 +113,16 @@ chmod +x /usr/local/bin/go2rtc
 
 echo -e "${GREEN}[6/8] Configuring Python Virtual Environment...${NC}"
 python3 -m venv "${INSTALL_DIR}/venv"
-PIP_NET="--retries 10 --timeout 60"
-# Upgrading pip is nice to have, not required.
-"${INSTALL_DIR}/venv/bin/pip" install ${PIP_NET} --upgrade pip -q || true
-if ! "${INSTALL_DIR}/venv/bin/pip" install ${PIP_NET} -r "${INSTALL_DIR}/requirements.txt" -q; then
+PIP_NET="--retries 2 --timeout 20"
+# One quick reachability check instead of letting pip retry for many
+# minutes: some networks reach PyPI's index but not its file host.
+PYPI_OK=0
+curl -fsS -m 10 -o /dev/null https://files.pythonhosted.org/ 2>/dev/null && PYPI_OK=1
+if [ "$PYPI_OK" = 1 ]; then
+  # Upgrading pip is nice to have, not required.
+  "${INSTALL_DIR}/venv/bin/pip" install ${PIP_NET} --upgrade pip -q || true
+fi
+if [ "$PYPI_OK" != 1 ] || ! "${INSTALL_DIR}/venv/bin/pip" install ${PIP_NET} -r "${INSTALL_DIR}/requirements.txt" -q; then
   # PyPI unreachable or flaky from this network: use the distro's own
   # packages instead, seen through the venv.
   echo -e "${YELLOW}  -> PyPI download failed; using system Python packages instead${NC}"
