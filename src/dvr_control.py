@@ -1690,11 +1690,22 @@ async function loadSettingsModal() {
       inp.addEventListener('change', async (e) => {
         const dvrKey = e.target.dataset.dvr;
         const enabled = e.target.checked;
-        const resp = await fetch('/api/dvr/toggle', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({dvr: dvrKey, enabled: enabled})
-        });
+        // Newest click wins: answers to older clicks are ignored.
+        const seq = (window._toggleSeq = (window._toggleSeq || 0) + 1);
+        setStatus(`${dvrKey.toUpperCase()}: applying…`);
+        let resp;
+        try {
+          resp = await fetch('/api/dvr/toggle', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({dvr: dvrKey, enabled: enabled}),
+            signal: AbortSignal.timeout(8000)
+          });
+        } catch (err) {
+          if (seq === window._toggleSeq) setStatus(`${dvrKey.toUpperCase()}: no answer — the board is busy, try again`);
+          return;
+        }
+        if (seq !== window._toggleSeq) return;
         if (resp.ok) {
           setStatus(`${dvrKey.toUpperCase()} ${enabled ? 'Enabled' : 'Disabled (WAN saved)'}`);
           await loadChannels();
@@ -2265,11 +2276,39 @@ def api_dvr_toggle():
     enabled = bool(body.get("enabled"))
     ok = dvr_config.toggle_dvr(dvr_key, enabled)
     if ok:
-        ensure_roster()
-        if current_mode == "grid":
-            launch_grid()
+        _refresh_wall_async()
         return jsonify({"ok": True})
     return jsonify({"error": "DVR not found"}), 404
+
+
+_wall_refresh_lock = threading.Lock()
+_wall_refresh_again = threading.Event()
+
+
+def _refresh_wall_async():
+    """Re-roster the wall after a source change without holding the request.
+
+    Repeated clicks don't queue: if a refresh is already running, it is told
+    to run once more with the newest config when it finishes, and every
+    further click before then is folded into that same rerun."""
+    _wall_refresh_again.set()
+    if not _wall_refresh_lock.acquire(blocking=False):
+        return
+
+    def run():
+        try:
+            while _wall_refresh_again.is_set():
+                _wall_refresh_again.clear()
+                try:
+                    ensure_roster()
+                    if current_mode == "grid":
+                        launch_grid()
+                except Exception as e:
+                    print(f"refresh_wall: {e}", flush=True)
+        finally:
+            _wall_refresh_lock.release()
+
+    threading.Thread(target=run, daemon=True, name="wall-refresh").start()
 
 
 @app.route('/api/dvr/add', methods=['POST'])
